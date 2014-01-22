@@ -40,7 +40,7 @@ typedef struct {
   request req;
   response res;
 
-  request_completed_handler cb;
+  http_request_handler cb;
   void *arg;
 } transaction;
 
@@ -104,7 +104,7 @@ free_transaction( transaction *trans ) {
   if ( trans->handle != NULL ) {
     curl_easy_cleanup( trans->handle );
   }
-  if ( transaction->slist != NULL ) {
+  if ( trans->slist != NULL ) {
     curl_slist_free_all( trans->slist );
   }
   if ( trans->req.content.body != NULL ) {
@@ -120,12 +120,14 @@ free_transaction( transaction *trans ) {
 static bool
 add_transaction( transaction *trans, CURL *handle ) {
   trans->handle = handle;
-  CURLMcode ret = curl_multi_add_handle( curl_handle, trans->handle );
+
+  CURLMcode ret = curl_multi_add_handle( handle, trans->handle );
   if ( ret != CURLM_OK && ret != CURLM_CALL_MULTI_PERFORM ) {
-    error( "Failed to add an easy handle to a multi handle ( curl_handle = %p, handle = %p, error = %s ).",
-           curl_handle, transaction->handle, curl_multi_strerror( ret ) );
+    error( "Failed to add an easy handle to a multi handle ( handle = %p, handle = %p, error = %s ).",
+           handle, trans->handle, curl_multi_strerror( ret ) );
     return false;
   }
+
   ret = curl_multi_perform( curl_handle, &curl_running );
   if ( ret != CURLM_OK && ret != CURLM_CALL_MULTI_PERFORM ) {
     error( "Failed to run a multi handle ( curl_handle = %p, error = %s ).", curl_handle, curl_multi_strerror( ret ) );
@@ -137,7 +139,8 @@ add_transaction( transaction *trans, CURL *handle ) {
     return false;
   }
 
-  void *duplicated = insert_hash_entry( transactions, transaction->handle, transaction );
+  void *duplicated = insert_hash_entry( transactions, transaction->handle,
+                                        transaction );
   if ( duplicated != NULL ) {
     // FIXME: handle duplication properly
     warn( "Duplicated HTTP transaction found ( %p ).", duplicated );
@@ -247,6 +250,7 @@ set_contents( CURL *handle, transaction *trans ) {
 
   if ( strlen( req->content.content_type ) > 0 ) {
     char content_type[ 128 ];
+
     memset( content_type, '\0', sizeof( content_type ) );
     snprintf( content_type, sizeof( content_type ), "Content-Type: %s",
               req->content.content_type );
@@ -257,12 +261,14 @@ set_contents( CURL *handle, transaction *trans ) {
                                       "Content-Type: text/plain" );
   }
 
-  CURLcode ret = curl_easy_setopt( handle, CURLOPT_READFUNCTION, read_from_buffer );
+  CURLcode ret = curl_easy_setopt( handle, CURLOPT_READFUNCTION,
+                                   read_from_buffer );
   if ( ret != CURLE_OK ) {
     error( "Failed READFUNC ( handle = %p, error = %s ).",
            handle, curl_easy_strerror( ret ) );
     return false;
   }
+
   ret = curl_easy_setopt( handle, CURLOPT_READDATA, req->content.body );
   if ( ret != CURLE_OK ) {
     error( "Failed READDATA ( handle = %p, error = %s ).",
@@ -274,12 +280,12 @@ set_contents( CURL *handle, transaction *trans ) {
 
 
 static void
-transaction_from_main( transaction *trans ) {
+transaction_from_main_th( transaction *trans ) {
   request *req = &trans->req;
-  uint32_t content_length = 0;
+  uint32_t length = 0;
 
   if ( req->content.body != NULL && req->content.body->length > 0 ) {
-    content_length = ( uint32_t ) --req->content.body->length; // We only accept null-terminated string.
+    length = ( uint32_t ) --req->content.body->length; // We only accept null-terminated string.
   }
 
   trans->slist = NULL;
@@ -292,7 +298,7 @@ transaction_from_main( transaction *trans ) {
       ret = curl_easy_setopt( handle, CURLOPT_HTTPGET, 1 );
       if ( ret != CURLE_OK ) {
         error( "Failed HTTP GET ( handle = %p, error = %s ).",
-               handle, curl_easy_strerror( retval ) );
+               handle, curl_easy_strerror( ret ) );
         goto error;
       }
     }
@@ -303,13 +309,13 @@ transaction_from_main( transaction *trans ) {
       ret = curl_easy_setopt( handle, CURLOPT_UPLOAD, 1 );
       if ( ret != CURLE_OK ) {
         error( "Failed HTTP PUT ( handle = %p, error = %s ).",
-               handle, curl_easy_strerror( retval ) );
+               handle, curl_easy_strerror( ret ) );
         goto error;
       }
-      ret = curl_easy_setopt( handle, CURLOPT_INFILESIZE, content_length );
+      ret = curl_easy_setopt( handle, CURLOPT_INFILESIZE, length );
       if ( ret != CURLE_OK ) {
-        error( "Failed length ( content_length = %u, handle = %p, error = %s ).",
-               content_length, handle, curl_easy_strerror( ret ) );
+        error( "Failed length ( length = %u, handle = %p, error = %s ).",
+               length, handle, curl_easy_strerror( ret ) );
         goto error;
       }
       trans->slist = curl_slist_append( trans->slist, "Expect:" );
@@ -324,10 +330,10 @@ transaction_from_main( transaction *trans ) {
                handle, curl_easy_strerror( ret ) );
         goto error;
       }
-      ret = curl_easy_setopt( handle, CURLOPT_POSTFIELDSIZE, content_length );
+      ret = curl_easy_setopt( handle, CURLOPT_POSTFIELDSIZE, length );
       if ( ret != CURLE_OK ) {
-        error( "Failed content length value ( content_length = %u, handle = %p, error = %s ).",
-               content_length, handle, curl_easy_strerror( ret ) );
+        error( "Failed length value ( length = %u, handle = %p, error = %s ).",
+               length, handle, curl_easy_strerror( ret ) );
         goto error;
       }
     }
@@ -362,18 +368,21 @@ transaction_from_main( transaction *trans ) {
            handle, trans, curl_easy_strerror( ret ) );
     goto error;
   }
+
   ret = curl_easy_setopt( handle, CURLOPT_URL, req->uri );
   if ( ret != CURLE_OK ) {
     error( "Failed URL ( uri = %s, handle = %p, transaction = %p, error = %s ).",
            req->uri, handle, transaction, curl_easy_strerror( ret ) );
     goto error;
   }
+
   ret = curl_easy_setopt( handle, CURLOPT_NOPROGRESS, 1 );
   if ( ret != CURLE_OK ) {
     error( "Failed NOPROGRESS ( handle = %p, transaction = %p, error = %s ).",
            handle, trans, curl_easy_strerror( ret ) );
     goto error;
   }
+
   ret = curl_easy_setopt( handle, CURLOPT_WRITEFUNCTION, write_to_buffer );
   if ( ret != CURLE_OK ) {
     error( "Failed WRITE FUNC ( handle = %p, transaction = %p, error = %s ).",
@@ -383,12 +392,14 @@ transaction_from_main( transaction *trans ) {
 
   response *res = &trans->res;
   res->content.body = alloc_buffer_with_length( 1024 );
+
   ret = curl_easy_setopt( handle, CURLOPT_WRITEDATA, res->content.body );
   if ( ret != CURLE_OK ) {
     error( "Failed WRITE DATA ( handle = %p, transaction = %p, error = %s ).",
            handle, trans, curl_easy_strerror( ret ) );
     goto error;
   }
+
   if ( trans->slist != NULL ) {
     ret = curl_easy_setopt( handle, CURLOPT_HTTPHEADER, trans->slist );
     if ( ret != CURLE_OK ) {
@@ -409,6 +420,7 @@ error:
     curl_slist_free_all( trans->slist );
     trans->slist = NULL;
   }
+
   res = &trans->res;
   res->status = TRANSACTION_FAILED;
   res->code = 0;
@@ -416,9 +428,9 @@ error:
 }
 
 
-/***********************************************************************************
+/******************************************************************************
  * HTTP client thread context funcsions
- ***********************************************************************************/
+ *****************************************************************************/
 static bool
 finalize_curl(GlobalInfo *g) {
   if (g->multi) {
@@ -479,9 +491,9 @@ http_client_req( void *arg )
   handle_transaction_from_main( trans );
 }
 
-/***********************************************************************************
+/*****************************************************************************
  * main thread context funcsions
- ***********************************************************************************/
+ ****************************************************************************/
 static void
 http_client_res( void *arg )
 {
@@ -503,11 +515,12 @@ http_client_res( void *arg )
   free_transaction( trans );
 }
 
+
 /*
  * from main thread to http thread
  */
 bool
-do_request( uint8_t method,
+do_http_request( uint8_t method,
                  const char *uri,
                  const http_content *content,
                  request_completed_handler cb,

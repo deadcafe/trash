@@ -44,22 +44,18 @@ typedef struct {
   buffer *body;
 } http_content;
 
-typedef void ( *http_request_handler )(
+typedef void ( *request_completed_handler )(
   int status,
   int code,
   const http_content *content,
-  void *cb_arg
+  void *user_data
 );
 
 
-extern bool do_http_request( uint8_t method,
-                             const char *uri,
-                             const http_content *content,
-                             http_request_handler cb,
-                             void *cb_arg );
-
-extern bool init_http_client();
-extern bool finalize_http_client();
+bool do_http_request( uint8_t method, const char *uri, const http_content *content,
+                      request_completed_handler completed_callback, void *completed_user_data );
+bool init_http_client();
+bool finalize_http_client();
 
 
 #endif // HTTP_CLIENT_H

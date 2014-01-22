@@ -23,6 +23,8 @@ SRCS = main.c \
        http_client.c queue.c \
 	bd_fifo.c
 
+SRCS = hiperfifo.c
+
 #for libevent support
 CPPFLAGS += -DENABLE_LIBEVENT -I./compat
 LDFLAGS += -pthread -levent
