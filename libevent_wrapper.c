@@ -95,7 +95,7 @@ typedef struct {
   ssize_t refcnt;
 
   int state;
-  short flags;
+  short cur_flags;
   short padding;
 
   struct event *ev;
@@ -121,6 +121,13 @@ static suseconds_t tick = 0;
 
 static void clear_cache_ctx( ev_base_t *ev_base );
 static void clear_db_all_ctx( ev_base_t *ev_base );
+
+static void destroy_event_handle( event_handle_t *handle );
+
+
+
+
+
 
 /*
  * heartbeat timer
@@ -458,9 +465,7 @@ del_ev_ctx( ctx_t *ctx )
   if ( ctx->hd.state & CTX_STATE_ADDED_EV ) {
     ctx->hd.state &= ~CTX_STATE_ADDED_EV;
     event_del( ctx->hd.ev );
-    ctx->hd.flags = 0;
-    TRACE( "fd:%d cnt:%d state:%x", ctx->handle.fd, ctx->hd.refcnt,
-           ctx->hd.state );
+    TRACE( "fd:%d cnt:%d state:%x", ctx->handle.fd, ctx->hd.refcnt, ctx->hd.state );
     detach_ctx( ctx );
   }
 }
@@ -480,7 +485,7 @@ add_ev_ctx( ctx_t *ctx, const struct timeval *tm )
 }
 
 #define VALID_TV(_a) (((_a)->tv_sec > 0 || (_a)->tv_usec > 0) ? 1 : 0)
-#define VALID_CTX(_a) (!((_a)->hd.flags & CTX_STATE_INVALID))
+#define VALID_CTX(_a) (!((_a)->hd.state & CTX_STATE_INVALID))
 
 static void
 handler_core( int fd, short flags, void *arg )
@@ -491,67 +496,44 @@ handler_core( int fd, short flags, void *arg )
   assert( ctx && ctx->handle.fd == fd );
 
   attach_ctx( ctx );
+  ctx->hd.cur_flags = flags;
 
-  ctx->handle.flags |= flags;
   if ( !( event_get_events( ctx->hd.ev ) & EV_PERSIST ) )
     del_ev_ctx( ctx );
 
   if ( flags & EV_TIMEOUT && VALID_CTX( ctx ) ) {
-    if ( ctx->handle.old_style ) {
-      timer_callback cb = ctx->handle.u.timer_val.timer_cb;
-      cb( ctx->handle.u.timer_val.timer_data );
-    }
-    else {
-      new_event_cb_t cb = ctx->handle.u.timer_val.timer_cb;
-      cb( -1, &ctx->handle, ctx->handle.u.timer_val.timer_data );
-    }
+    timer_callback cb = ctx->handle.u.timer_val.timer_cb;
+    cb( ctx->handle.u.timer_val.timer_data );
+
     if ( VALID_TV( &ctx->handle.u.timer_val.interval ) ) {
       event_assign( ctx->hd.ev, ctx->hd.base->base, -1, EV_PERSIST,
                     handler_core, ctx );
       add_ev_ctx( ctx, &ctx->handle.u.timer_val.interval );
+      ctx->handle.flags = EV_PERSIST;
       memset( &ctx->handle.u.timer_val.interval, 0,
               sizeof( ctx->handle.u.timer_val.interval ) );
     }
-
   }
   else if ( flags & EV_SIGNAL ) {
-    if ( ctx->handle.old_style ) {
-      void (*cb)( int ) = ctx->handle.u.signal_val.signal_cb;
-      cb( fd );
-    }
-    else {
-      new_event_cb_t cb = ctx->handle.u.signal_val.signal_cb;
-      cb( fd, &ctx->handle, ctx->handle.u.signal_val.signal_data );
-    }
+    void (*cb)( int ) = ctx->handle.u.signal_val.signal_cb;
+    cb( fd );
   }
   else {
     CACHE_STORE( ctx->hd.base, ctx );
 
     if ( flags & EV_READ && VALID_CTX( ctx ) && ctx->handle.u.fd_val.read_cb ) {
-      if ( ctx->handle.old_style ) {
-        event_fd_callback cb = ctx->handle.u.fd_val.read_cb;
-        cb( fd, ctx->handle.u.fd_val.read_data );
-      }
-      else {
-        new_event_cb_t cb = ctx->handle.u.fd_val.read_cb;
-        cb( fd, &ctx->handle, ctx->handle.u.fd_val.read_data );
-      }
+      event_fd_callback cb = ctx->handle.u.fd_val.read_cb;
+      cb( fd, ctx->handle.u.fd_val.read_data );
     }
 
-    if ( flags & EV_WRITE && VALID_CTX( ctx )
-         && ctx->handle.u.fd_val.write_cb ) {
-      if ( ctx->handle.old_style ) {
-        event_fd_callback cb = ctx->handle.u.fd_val.write_cb;
-        cb( fd, ctx->handle.u.fd_val.write_data );
-      }
-      else {
-        new_event_cb_t cb = ctx->handle.u.fd_val.write_cb;
-        cb( fd, &ctx->handle, ctx->handle.u.fd_val.write_data );
-      }
+    if ( flags & EV_WRITE && VALID_CTX( ctx ) && ctx->handle.u.fd_val.write_cb ) {
+      event_fd_callback cb = ctx->handle.u.fd_val.write_cb;
+      cb( fd, ctx->handle.u.fd_val.write_data );
     }
 
     CACHE_CLEAR( ctx->hd.base );
   }
+  ctx->hd.cur_flags = 0;
   detach_ctx( ctx );
   TRACE( "<--- end fd:%d", fd );
 }
@@ -748,7 +730,6 @@ set_fd_handler_raw( ev_base_t *ev_base,
                                                     write_cb, write_d );
   if ( handle ) {
     ctx_t *ctx = container_of( handle, ctx_t, handle );
-    handle->old_style = true;
     detach_ctx( ctx );
     return true;
   }
@@ -776,7 +757,7 @@ set_fd_handler_x( int fd,
 /***************************************************************************
  *
  ***************************************************************************/
-void
+static void
 destroy_event_handle( event_handle_t *handle )
 {
   assert( handle );
@@ -826,92 +807,23 @@ delete_fd_handler_x( int fd )
  *
  ***************************************************************************/
 static void
-set_flags_ctx( ctx_t *ctx, short flags )
+update_flags_ctx( ctx_t *ctx, short flags )
 {
-  short next = ctx->hd.flags | flags;
+  if (ctx->handle.flags != flags) {
+  TRACE( "fd:%d set flags:0x%x->0x%x state:%x",
+         ctx->handle.fd, ctx->handle.flags, flags, ctx->hd.state );
 
-  TRACE( "fd:%d set flags:%x->%x state:%x",
-         ctx->handle.fd, ctx->hd.flags, next, ctx->hd.state );
+    del_ev_ctx( ctx );
 
-  ctx->handle.flags &= ( ( short ) ~flags );
-
-  if ( ctx->hd.state & CTX_STATE_ADDED_EV ) {
-    if ( event_get_events( ctx->hd.ev ) & flags ) {
-      /* already set ... skip */
-      TRACE( "already set flags" );
-    }
-    else {
-      TRACE( "re-set flags:%x->%x", ctx->hd.flags, next );
-      del_ev_ctx( ctx );
-      ctx->hd.flags = next;
+    if (flags) {
       event_assign( ctx->hd.ev, ctx->hd.base->base,
-                    ctx->handle.fd, ctx->hd.flags, handler_core, ctx );
+                    ctx->handle.fd, (flags | EV_PERSIST), handler_core, ctx );
       add_ev_ctx( ctx, NULL );
     }
-  }
-  else {
-    ctx->hd.flags = next;
-    TRACE( "set flags:%x", ctx->hd.flags );
-    event_assign( ctx->hd.ev, ctx->hd.base->base,
-                  ctx->handle.fd, ctx->hd.flags, handler_core, ctx );
-    add_ev_ctx( ctx, NULL );
+    ctx->handle.flags = flags;
   }
 }
 
-static void
-clear_flags_ctx( ctx_t *ctx, short flags )
-{
-  short next = ctx->hd.flags & ( ( short ) ~flags );
-  TRACE( "fd:%d cleared flags:%x->%x state:%x",
-         ctx->handle.fd, ctx->hd.flags, next, ctx->hd.state );
-
-  ctx->handle.flags |= flags;
-
-  if ( ctx->hd.state & CTX_STATE_ADDED_EV ) {
-    if ( event_get_events( ctx->hd.ev ) & flags ) {
-      if ( ctx->hd.flags ) {
-        TRACE( "re-set flags:%x->%x", ctx->hd.flags, next );
-        del_ev_ctx( ctx );
-        ctx->hd.flags = next;
-        event_assign( ctx->hd.ev, ctx->hd.base->base,
-                      ctx->handle.fd, ctx->hd.flags, handler_core, ctx );
-        add_ev_ctx( ctx, NULL );
-      }
-      else {
-        TRACE( "clear flags" );
-        del_ev_ctx( ctx );
-      }
-    }
-  }
-}
-
-void
-add_read_event( event_handle_t *handle )
-{
-  ctx_t *ctx = container_of( handle, ctx_t, handle );
-  set_flags_ctx( ctx, EV_READ );
-}
-
-void
-pending_read_event( event_handle_t *handle )
-{
-  ctx_t *ctx = container_of( handle, ctx_t, handle );
-  clear_flags_ctx( ctx, EV_READ );
-}
-
-void
-add_write_event( event_handle_t *handle )
-{
-  ctx_t *ctx = container_of( handle, ctx_t, handle );
-  set_flags_ctx( ctx, EV_WRITE );
-}
-
-void
-pending_write_event( event_handle_t *handle )
-{
-  ctx_t *ctx = container_of( handle, ctx_t, handle );
-  clear_flags_ctx( ctx, EV_WRITE );
-}
 
 static void
 set_flags_raw( ev_base_t *ev_base, int fd, short flags, bool set )
@@ -925,23 +837,23 @@ set_flags_raw( ev_base_t *ev_base, int fd, short flags, bool set )
   assert( ctx );
 
   if ( set )
-    set_flags_ctx( ctx, flags );
+    update_flags_ctx( ctx, ctx->handle.flags | flags );
   else
-    clear_flags_ctx( ctx, flags );
+    update_flags_ctx( ctx, ctx->handle.flags & ( ( short ) ~flags ) );
 }
 
 static void
 set_readable_r( int fd, bool state )
 {
   TRACE( "fd:%d state:%d", fd, state );
-  set_flags_raw( get_ev_base( SAFE ), fd, EV_READ | EV_PERSIST, state );
+  set_flags_raw( get_ev_base( SAFE ), fd, EV_READ, state );
 }
 
 static void
 set_readable_x( int fd, bool state )
 {
   TRACE( "fd:%d set:%d", fd, state );
-  set_flags_raw( Base, fd, EV_READ | EV_PERSIST, state );
+  set_flags_raw( Base, fd, EV_READ, state );
 }
 
 /***************************************************************************
@@ -951,33 +863,26 @@ static void
 set_writable_r( int fd, bool state )
 {
   TRACE( "fd:%d state:%d", fd, state );
-  set_flags_raw( get_ev_base( SAFE ), fd, EV_WRITE | EV_PERSIST, state );
+  set_flags_raw( get_ev_base( SAFE ), fd, EV_WRITE, state );
 }
 
 static void
 set_writable_x( int fd, bool state )
 {
   TRACE( "fd:%d state:%d", fd, state );
-  set_flags_raw( Base, fd, EV_WRITE | EV_PERSIST, state );
+  set_flags_raw( Base, fd, EV_WRITE, state );
 }
 
 /***************************************************************************
  *
  ***************************************************************************/
-bool
-is_readable( const event_handle_t *handle )
-{
-  TRACE( "fd:%d flags:%x", handle->fd, handle->flags );
-  return ( handle->flags & EV_READ );
-}
-
 static bool
 readable_raw( ev_base_t *ev_base, int fd )
 {
   TRACE( "base:%p fd:%d", ev_base, fd );
   ctx_t *ctx = find_ctx_fd( ev_base, fd );
   if ( ctx )
-    return is_readable( &ctx->handle );
+    return ( ctx->hd.cur_flags & EV_READ );
   return false;
 }
 
@@ -996,20 +901,13 @@ readable_x( int fd )
 /***************************************************************************
  *
  ***************************************************************************/
-bool
-is_writable( const event_handle_t *handle )
-{
-  TRACE( "fd:%d flags:%x", handle->fd, handle->flags );
-  return ( handle->flags & EV_WRITE );
-}
-
 static bool
 writable_raw( ev_base_t *ev_base, int fd )
 {
   TRACE( "" );
   ctx_t *ctx = find_ctx_fd( ev_base, fd );
   if ( ctx )
-    return is_writable( &ctx->handle );
+    return ( ctx->hd.cur_flags & EV_WRITE );
   return false;
 }
 
@@ -1210,35 +1108,16 @@ create_timer_handle_raw( ev_base_t *ev_base,
   event_assign( ctx->hd.ev, ctx->hd.base->base,
                 ctx->handle.fd, flags, handler_core, ctx );
   add_ev_ctx( ctx, time );
+  ctx->handle.flags = flags;
 
   return &ctx->handle;
 }
 
-event_handle_t *
-create_timer_handle_r( const struct timeval *time,
-                       const struct timeval *interval,
-                       new_event_cb_t cb, void *arg )
-{
-  if ( !time && !interval )
-    return NULL;
-  return create_timer_handle_raw( get_ev_base( SAFE ), time, interval, cb,
-                                  arg );
-}
-
-event_handle_t *
-create_timer_handle( const struct timeval *time,
-                     const struct timeval *interval,
-                     new_event_cb_t cb, void *arg )
-{
-  if ( !time && !interval )
-    return NULL;
-  return create_timer_handle_raw( Base, time, interval, cb, arg );
-}
 
 static bool
 add_timer_event_callback_raw( ev_base_t *ev_base,
                               struct itimerspec *interval,
-                              timer_callback callback, void *user_data )
+                              timer_callback cb, void *arg )
 {
   struct timeval tm, it_tm;
   struct timeval *tm_p = NULL, *it_tm_p = NULL;
@@ -1255,10 +1134,8 @@ add_timer_event_callback_raw( ev_base_t *ev_base,
   if ( !it_tm_p && !tm_p )
     return false;
 
-  handle =
-    create_timer_handle_raw( ev_base, tm_p, it_tm_p, callback, user_data );
+  handle = create_timer_handle_raw( ev_base, tm_p, it_tm_p, cb, arg );
   if ( handle ) {
-    handle->old_style = true;
     return true;
   }
   return false;
@@ -1266,17 +1143,16 @@ add_timer_event_callback_raw( ev_base_t *ev_base,
 
 static bool
 add_timer_event_callback_r( struct itimerspec *interval,
-                            timer_callback callback, void *user_data )
+                            timer_callback cb, void *arg )
 {
-  return add_timer_event_callback_raw( get_ev_base( SAFE ), interval,
-                                       callback, user_data );
+  return add_timer_event_callback_raw( get_ev_base( SAFE ), interval, cb, arg );
 }
 
 static bool
 add_timer_event_callback_x( struct itimerspec *interval,
-                            timer_callback callback, void *user_data )
+                            timer_callback cb, void *arg )
 {
-  return add_timer_event_callback_raw( Base, interval, callback, user_data );
+  return add_timer_event_callback_raw( Base, interval, cb, arg );
 }
 
 /*
@@ -1285,30 +1161,27 @@ add_timer_event_callback_x( struct itimerspec *interval,
 static bool
 add_periodic_event_callback_raw( ev_base_t *ev_base,
                                  const time_t seconds,
-                                 timer_callback callback, void *user_data )
+                                 timer_callback cb, void *arg )
 {
   struct itimerspec interval;
 
   memset( &interval, 0, sizeof( interval ) );
   interval.it_interval.tv_sec = seconds;
-  return add_timer_event_callback_raw( ev_base, &interval, callback,
-                                       user_data );
+  return add_timer_event_callback_raw( ev_base, &interval, cb, arg );
 }
 
 static inline bool
-add_periodic_event_callback_r( const time_t seconds,
-                               timer_callback callback, void *user_data )
+add_periodic_event_callback_r( const time_t sec,
+                               timer_callback cb, void *arg )
 {
-  return add_periodic_event_callback_raw( get_ev_base( SAFE ), seconds,
-                                          callback, user_data );
+  return add_periodic_event_callback_raw( get_ev_base( SAFE ), sec, cb, arg );
 }
 
 static bool
-add_periodic_event_callback_x( const time_t seconds,
-                               timer_callback callback, void *user_data )
+add_periodic_event_callback_x( const time_t sec,
+                               timer_callback cb, void *arg )
 {
-  return add_periodic_event_callback_raw( Base, seconds, callback,
-                                          user_data );
+  return add_periodic_event_callback_raw( Base, sec, cb, arg );
 }
 
 /*
@@ -1316,27 +1189,27 @@ add_periodic_event_callback_x( const time_t seconds,
  */
 static bool
 delete_timer_event_raw( ev_base_t *ev_base,
-                        timer_callback callback, void *user_data )
+                        timer_callback cb, void *arg )
 {
-  ctx_t *ctx = find_ctx_tm( ev_base, callback, user_data );
+  ctx_t *ctx = find_ctx_tm( ev_base, cb, arg );
 
   if ( ctx ) {
-    destroy_timer_handle( &ctx->handle );
+    destroy_event_handle( &ctx->handle );
     return true;
   }
   return false;
 }
 
 static bool
-delete_timer_event_r( timer_callback callback, void *user_data )
+delete_timer_event_r( timer_callback cb, void *arg )
 {
-  return delete_timer_event_raw( get_ev_base( SAFE ), callback, user_data );
+  return delete_timer_event_raw( get_ev_base( SAFE ), cb, arg );
 }
 
 static bool
-delete_timer_event_x( timer_callback callback, void *user_data )
+delete_timer_event_x( timer_callback cb, void *arg )
 {
-  return delete_timer_event_raw( Base, callback, user_data );
+  return delete_timer_event_raw( Base, cb, arg );
 }
 
 /*
@@ -1387,17 +1260,6 @@ create_signal_handle_raw( ev_base_t *ev_base,
   return &ctx->handle;
 }
 
-event_handle_t *
-create_signal_handle_r( int sig_no, new_event_cb_t cb, void *arg )
-{
-  return create_signal_handle_raw( get_ev_base( SAFE ), sig_no, cb, arg );
-}
-
-event_handle_t *
-create_signal_handle( int sig_no, new_event_cb_t cb, void *arg )
-{
-  return create_signal_handle_raw( Base, sig_no, cb, arg );
-}
 
 static bool
 reg_signal_handler_raw( int signum, void (*cb)( int ) )
@@ -1407,12 +1269,12 @@ reg_signal_handler_raw( int signum, void (*cb)( int ) )
   handle = create_signal_handle_raw( Base, signum, (new_event_cb_t) cb, NULL );
   if ( handle ) {
     ctx_t *ctx = container_of( handle, ctx_t, handle );
-    handle->old_style = true;
     detach_ctx( ctx );
     return true;
   }
   return false;
 }
+
 
 static bool
 init_signal_handler_raw( void )
@@ -1420,11 +1282,13 @@ init_signal_handler_raw( void )
   return true;
 }
 
+
 static bool
 finalize_signal_handler_raw( void )
 {
   return true;
 }
+
 
 static void
 reg_signal_wrapper( void )
