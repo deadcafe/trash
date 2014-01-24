@@ -20,16 +20,14 @@
 
 /* HTTP client thread info */
 typedef struct {
-  struct event_base *evbase;
-  struct event *timer_ev;
   CURLM *multi;
   int running;
+  bool timer;
 } http_th_info_t;
 
 
 typedef struct {
   CURL *easy;
-  struct event *ev;
   http_th_info_t *th_info;
 
   curl_socket_t sock;
@@ -40,7 +38,7 @@ typedef struct {
 } http_transaction_t;
 
 extern void destroy_http_th(http_th_info_t *th_info);
-extern http_th_info_t *create_http_th(struct event_base *base);
+extern http_th_info_t *create_http_th(void);
 
 extern http_transaction_t *create_http_transaction(http_th_info_t *th_info,
                                                    const char *url);

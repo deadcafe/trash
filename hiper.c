@@ -11,8 +11,12 @@
 #include <fcntl.h>
 #include <errno.h>
 
+#include <trema.h>
 
 #include "hiper.h"
+
+static void clean_completed_http_transaction(http_th_info_t *th_info);
+
 
 #define EASY_SETOPT(_e, _o, _p) {                       \
     CURLcode _rc = curl_easy_setopt((_e), (_o), (_p));  \
@@ -82,33 +86,55 @@ multi_add_easy(CURLM *multi,
 }
 #define	MULTI_ADD_EASY(_m, _e)	multi_add_easy((_m), (_e), __func__)
 
-
-static inline short
-action2event(int action)
+/*****************************************************************************
+ * Multi Timer
+ *****************************************************************************/
+/* Called by libevent when our timeout expires */
+static void
+multi_timer_cb(void *arg)
 {
-  short events = 0;
+  http_th_info_t *th_info = arg;
 
-  if (action & CURL_POLL_IN)
-    events |= EV_READ;
-  if (action & CURL_POLL_OUT)
-    events |= EV_WRITE;
+  TRACE("Polling Timer Expired----->");
 
-  if (events)
-    events |= EV_PERSIST;
-  return events;
+  th_info->timer = false;
+
+  if (MULTI_ACTION(th_info->multi, CURL_SOCKET_TIMEOUT, 0, &th_info->running))
+    exit(1);
+
+  clean_completed_http_transaction(th_info);
+
+  TRACE("<-----Polling Timer Expired: running:%d", th_info->running);
 }
 
-static inline int
-event2action(short event)
+
+/* Update the event timer after curl_multi library calls */
+static int
+multi_timer_update(CURLM *multi __attribute__((unused)),
+                   long timeout_ms,
+                   http_th_info_t *th_info)
 {
-  int action = 0;
+  TRACE("%p %ld ms", th_info, timeout_ms);
+  if (timeout_ms >= 0) {
+    struct itimerspec to;
 
-  if (event & EV_READ)
-    action |= CURL_CSELECT_IN;
-  if (event & EV_WRITE)
-    action |= CURL_CSELECT_OUT;
+    memset(&to, 0, sizeof(to));
+    to.it_value.tv_sec = timeout_ms / 1000;
+    to.it_value.tv_nsec = (timeout_ms % 1000) * 1000L * 1000L;
 
-  return action;
+    if (th_info->timer) {
+      delete_timer_event(multi_timer_cb, th_info);
+      th_info->timer = false;
+    }
+    if (!add_timer_event_callback(&to, multi_timer_cb, th_info))
+      TRACE("ERROR: add_timer_event_callback");
+    else
+      th_info->timer = true;
+  } else if (th_info->timer) {
+    delete_timer_event(multi_timer_cb, th_info);
+    th_info->timer = false;
+  }
+  return 0;
 }
 
 /*****************************************************************************
@@ -118,18 +144,12 @@ void
 destroy_http_transaction(http_transaction_t *trans)
 {
   TRACE("trans:%p", trans);
+  if (trans->sock >= 0) {
+    delete_fd_handler(trans->sock);
+    trans->sock = -1;
+  }
 
   if (trans) {
-    if (trans->ev) {
-      if (event_pending(trans->ev, 0, NULL)) {
-        event_del(trans->ev);
-        TRACE("trans:%p del ev", trans);
-      }
-      event_free(trans->ev);
-      trans->ev = NULL;
-      TRACE("trans:%p FREE ev", trans);
-    }
-
     if (trans->easy) {
       curl_multi_remove_handle(trans->th_info->multi, trans->easy);
       curl_easy_cleanup(trans->easy);
@@ -197,12 +217,13 @@ create_http_transaction(http_th_info_t *th_info,
     trans->url[sizeof(trans->url) - 1] = '\0';
     trans->sock = -1;
 
-    trans->ev = event_new(th_info->evbase, -1, 0, NULL, trans);
-    if (!trans->ev)
-      goto error;
-
     if ((trans->easy = curl_easy_init()) == NULL)
       goto error;
+
+    //    EASY_SETOPT(trans->easy, CURLOPT_DNS_CACHE_TIMEOUT, 0L);
+    EASY_SETOPT(trans->easy, CURLOPT_TCP_NODELAY, 1L);
+    EASY_SETOPT(trans->easy, CURLOPT_TIMEOUT, 10L);
+    EASY_SETOPT(trans->easy, CURLOPT_CONNECTTIMEOUT, 3L);
 
     EASY_SETOPT(trans->easy, CURLOPT_URL, trans->url);
     EASY_SETOPT(trans->easy, CURLOPT_WRITEFUNCTION, trans_write_cb);
@@ -210,7 +231,7 @@ create_http_transaction(http_th_info_t *th_info,
     //    EASY_SETOPT(trans->easy, CURLOPT_VERBOSE, 1L);
     EASY_SETOPT(trans->easy, CURLOPT_ERRORBUFFER, trans->error);
     EASY_SETOPT(trans->easy, CURLOPT_PRIVATE, trans);
-    EASY_SETOPT(trans->easy, CURLOPT_NOPROGRESS, 0L);
+    EASY_SETOPT(trans->easy, CURLOPT_NOPROGRESS, 1L);
 
     if (MULTI_ADD_EASY(th_info->multi, trans->easy))
       goto error;
@@ -226,61 +247,68 @@ create_http_transaction(http_th_info_t *th_info,
 }
 
 static void
-trans_handler(int sock,
-              short events,
-              void *arg)
+trans_handler_raw(int sock,
+                  int action,
+                  http_transaction_t *trans)
 {
-  http_transaction_t *trans = arg;
   http_th_info_t *th_info = trans->th_info;
-  int action;
 
-  TRACE("trans:%p sock:%d events:0x%x", trans, sock, events);
+  TRACE("trans:%p sock:%d action:0x%x", trans, sock, action);
 
-  action = event2action(events);
   if (MULTI_ACTION(th_info->multi, sock, action, &th_info->running))
     destroy_http_transaction(trans);
 
   clean_completed_http_transaction(th_info);
 
   if (th_info->running <= 0) {
-    if (evtimer_pending(th_info->timer_ev, NULL)) {
+    if (th_info->timer) {
       TRACE("last transfer done, kill timeout");
-      evtimer_del(th_info->timer_ev);
+      delete_timer_event(multi_timer_cb, th_info);
+      th_info->timer = false;
     }
   }
+
+}
+
+static void
+trans_handler_in(int sock,
+                 void *arg)
+{
+  http_transaction_t *trans = arg;
+
+  trans_handler_raw(sock, CURL_CSELECT_IN, trans);
+}
+
+static void
+trans_handler_out(int sock,
+                  void *arg)
+{
+  http_transaction_t *trans = arg;
+
+  trans_handler_raw(sock, CURL_CSELECT_OUT, trans);
 }
 
 static inline int
 update_http_transaction(http_transaction_t *trans,
-                   curl_socket_t sock,
-                   int action)
+                        curl_socket_t sock,
+                        int action)
 {
-  short events;
   CURLMcode rc;
   http_th_info_t *th_info = trans->th_info;
   const char *whatstr[] = { "none", "IN", "OUT", "INOUT", "REMOVE" };
-
-  events = action2event(action);
-  if (trans->ev) {
-    short old = action2event(trans->action);
-    if (event_pending(trans->ev, old, NULL)) {
-      event_del(trans->ev);
-      TRACE("trans:%p del ev", trans);
-    }
-    event_assign(trans->ev, th_info->evbase, sock, events, trans_handler, trans);
-    event_add(trans->ev, NULL);
-  }
 
   if (trans->sock < 0) {
     rc = curl_multi_assign(th_info->multi, sock, trans);
     if (rc != CURLM_OK) {
       TRACE("ERROR: curl_multi_assign in %s returns %s",
             __func__, curl_multi_strerror(rc));
-      event_del(trans->ev);
       return -1;
     }
     trans->sock = sock;
+    set_fd_handler(sock, trans_handler_in, trans, trans_handler_out, trans);
   }
+  set_readable(sock, action & CURL_POLL_IN);
+  set_writable(sock, action & CURL_POLL_OUT);
 
   TRACE("trans:%p sock:%d Changing action from %s to %s",
         trans, sock, whatstr[trans->action], whatstr[action]);
@@ -305,12 +333,9 @@ update_http_transaction_handler(CURL *easy,
   assert(th_info);
 
   if (action == CURL_POLL_REMOVE) {
-    if (trans->ev) {
-      short old = action2event(trans->action);
-      if (event_pending(trans->ev, old, NULL)) {
-        event_del(trans->ev);
-        TRACE("trans:%p del ev", trans);
-      }
+    if (trans->sock >= 0) {
+      delete_fd_handler(trans->sock);
+      trans->sock = -1;
     }
     trans->action = action;
   } else {
@@ -322,54 +347,16 @@ update_http_transaction_handler(CURL *easy,
   return ret;
 }
 
-/*****************************************************************************
- * Multi Timer
- *****************************************************************************/
-/* Called by libevent when our timeout expires */
-static void
-multi_timer_cb(int fd __attribute__((unused)),
-               short events,
-               void *arg)
-{
-  http_th_info_t *th_info = arg;
-
-  TRACE("Polling Timer Expired----->: 0x%x", events);
-
-  if (MULTI_ACTION(th_info->multi, CURL_SOCKET_TIMEOUT, 0, &th_info->running))
-    exit(1);
-
-  clean_completed_http_transaction(th_info);
-
-  TRACE("<-----Polling Timer Expired: 0x%x running:%d",
-        events, th_info->running);
-}
-
-
-/* Update the event timer after curl_multi library calls */
-static int
-multi_timer_update(CURLM *multi __attribute__((unused)),
-                   long timeout_ms,
-                   http_th_info_t *th_info)
-{
-  TRACE("%p %ld ms", th_info, timeout_ms);
-  if (timeout_ms >= 0) {
-    struct timeval timeout;
-
-    timeout.tv_sec = timeout_ms / 1000;
-    timeout.tv_usec = (timeout_ms % 1000) * 1000;
-
-    evtimer_add(th_info->timer_ev, &timeout);
-  }
-  return 0;
-}
 
 /***************************************************************************/
 void
 destroy_http_th(http_th_info_t *th_info)
 {
   if (th_info) {
-    if (th_info->timer_ev)
-      event_free(th_info->timer_ev);
+    if (th_info->timer) {
+      delete_timer_event(multi_timer_cb, th_info);
+      th_info->timer = false;
+    }
     if (th_info->multi)
       curl_multi_cleanup(th_info->multi);
     FREE(th_info);
@@ -377,18 +364,14 @@ destroy_http_th(http_th_info_t *th_info)
 }
 
 http_th_info_t *
-create_http_th(struct event_base *base)
+create_http_th(void)
 {
   http_th_info_t *th_info;
 
   if ((th_info = MALLOC(sizeof(*th_info))) != NULL) {
     memset(th_info, 0, sizeof(*th_info));
-    th_info->evbase = base;
 
     if ((th_info->multi = curl_multi_init()) == NULL)
-      goto error;
-
-    if ((th_info->timer_ev = evtimer_new(th_info->evbase, multi_timer_cb, th_info)) == NULL)
       goto error;
 
     /* setup the generic multi interface options we want */

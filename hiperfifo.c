@@ -11,6 +11,9 @@
 #include <fcntl.h>
 #include <errno.h>
 
+#include <trema.h>
+#include "libevent_wrapper.h"
+
 #include "hiper.h"
 
 
@@ -19,15 +22,14 @@
  ****************************************************************************/
 typedef struct {
   http_th_info_t *th_info;
-  struct event *ev;
   FILE* input;
+  int sock;
 } fifo_info_t;
 
 
 /* This gets called whenever data is received from the fifo */
 static void
-fifo_cb(int fd __attribute__((unused)),
-        short events __attribute__((unused)),
+fifo_cb(int sock __attribute__((unused)),
         void *arg)
 {
   char s[1024];
@@ -56,19 +58,13 @@ destroy_fifo_info(fifo_info_t *fifo)
   if (fifo) {
     if (fifo->input)
       fclose(fifo->input);
-    if (fifo->ev) {
-      if (event_pending(fifo->ev, (EV_READ | EV_PERSIST), NULL))
-        event_del(fifo->ev);
-      event_free(fifo->ev);
-    }
     FREE(fifo);
   }
   unlink(FIFO);
 }
 
 static fifo_info_t *
-create_fifo_info(http_th_info_t *th_info,
-                 struct event_base *base)
+create_fifo_info(http_th_info_t *th_info)
 {
   fifo_info_t *fifo;
 
@@ -76,7 +72,7 @@ create_fifo_info(http_th_info_t *th_info,
     memset(fifo, 0, sizeof(*fifo));
 
     struct stat st;
-    int sockfd;
+    int sock;
 
     fifo->th_info = th_info;
 
@@ -95,16 +91,19 @@ create_fifo_info(http_th_info_t *th_info,
       goto error;
     }
 
-    sockfd = open(FIFO, O_RDWR | O_NONBLOCK, 0);
-    if (sockfd == -1) {
+    sock = open(FIFO, O_RDWR | O_NONBLOCK, 0);
+    if (sock == -1) {
       perror("open");
       goto error;
     }
-    fifo->input = fdopen(sockfd, "r");
+    fifo->input = fdopen(sock, "r");
+    fifo->sock = sock;
+
+    set_fd_handler(sock, fifo_cb, fifo, NULL, NULL);
+    set_readable(sock, true);
+    set_writable(sock, false);
 
     TRACE("Now, pipe some URL's into > %s", FIFO);
-    fifo->ev = event_new(base, sockfd, (EV_READ | EV_PERSIST), fifo_cb, fifo);
-    event_add(fifo->ev, NULL);
 
     if (0) {
     error:
@@ -119,23 +118,40 @@ create_fifo_info(http_th_info_t *th_info,
  * main
  *****************************************************************************/
 int
-main(void)
+main(int ac, char **av)
 {
   http_th_info_t *th_info;
   fifo_info_t *fifo;
-  struct event_base *base;
+  int opt;
 
-  unsetenv("http_proxy");
-  base = event_base_new();
+  while ((opt = getopt(ac, av, "p")) != -1) {
+    switch (opt) {
+    case 'p':	/* NO Proxy */
+      unsetenv("http_proxy");
+      break;
+    default:
+      fprintf(stderr, "%s [-p]\n", av[0]);
+      exit(0);
+    }
+  }
 
-  th_info = create_http_th(base);
-  fifo = create_fifo_info(th_info, base);
+  init_libevent_wrapper( xmalloc, NULL, xfree, 0 );
+  init_event_handler();
+  init_timer();
+  init_signal_handler();
 
-  event_base_dispatch(base);
+  th_info = create_http_th();
+  fifo = create_fifo_info(th_info);
+
+  start_event_handler();
 
   destroy_fifo_info(fifo);
   destroy_http_th(th_info);
 
-  event_base_free(th_info->evbase);
+  finalize_signal_handler();
+  finalize_timer();
+  finalize_event_handler();
+  finalize_libevent_wrapper();
+  fprintf(stderr, "END\n");
   return 0;
 }

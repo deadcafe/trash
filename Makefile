@@ -14,7 +14,7 @@ LDFLAGS = -L$(TREMA_LIB) -ltrema $(shell curl-config --libs)
 
 
 CFLAGS = \
-         -g -std=gnu99 -D_GNU_SOURCE -fno-strict-aliasing -Werror -Wall \
+         -g -O0 -std=gnu99 -D_GNU_SOURCE -fno-strict-aliasing -Werror -Wall \
          -Wextra -Wformat=2 -Wcast-qual -Wcast-align -Wwrite-strings \
          -Wconversion -Wfloat-equal -Wpointer-arith -pthread
 
@@ -23,7 +23,7 @@ SRCS = main.c \
        http_client.c queue.c \
 	bd_fifo.c
 
-SRCS = hiperfifo.c hiper.c
+SRCS = hiperfifo.c hiper.c queue.c bd_fifo.c
 
 #for libevent support
 CPPFLAGS += -DENABLE_LIBEVENT -I./compat

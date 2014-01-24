@@ -20,8 +20,13 @@
 #define USE_REDBLACK 1
 #define ENABLE_CAHCE 1
 
-#if 0
-# include "test/stub.h"
+#if 1
+# include <stdlib.h>
+# include <syslog.h>
+# define _log(pri_,fmt_,...)     fprintf(stdout,fmt_,##__VA_ARGS__)
+# define LOG(pri_,fmt_,...)      _log((pri_),"%s:%d:%s " fmt_ "\n", __FILE__,__LINE__,__func__, ##__VA_ARGS__)
+# define TRACE(fmt_,...)         LOG(LOG_DEBUG,fmt_,##__VA_ARGS__)
+
 #else
 # define TRACE(x,...)
 #endif
@@ -479,8 +484,8 @@ add_ev_ctx( ctx_t *ctx, const struct timeval *tm )
     return false;
   ctx->hd.state |= CTX_STATE_ADDED_EV;
   attach_ctx( ctx );
-  TRACE( "fd:%d cnt:%d state:%x flags:%x",
-         ctx->handle.fd, ctx->hd.refcnt, ctx->hd.state, ctx->hd.flags );
+  TRACE( "fd:%d cnt:%d state:%x",
+         ctx->handle.fd, ctx->hd.refcnt, ctx->hd.state );
   return true;
 }
 
@@ -498,14 +503,16 @@ handler_core( int fd, short flags, void *arg )
   attach_ctx( ctx );
   ctx->hd.cur_flags = flags;
 
-  if ( !( event_get_events( ctx->hd.ev ) & EV_PERSIST ) )
+  if ( !( event_get_events( ctx->hd.ev ) & EV_PERSIST ) ) {
     del_ev_ctx( ctx );
+  }
 
   if ( flags & EV_TIMEOUT && VALID_CTX( ctx ) ) {
     timer_callback cb = ctx->handle.u.timer_val.timer_cb;
-    cb( ctx->handle.u.timer_val.timer_data );
+    void *cb_arg = ctx->handle.u.timer_val.timer_data;
 
     if ( VALID_TV( &ctx->handle.u.timer_val.interval ) ) {
+      TRACE("re-assign timer");
       event_assign( ctx->hd.ev, ctx->hd.base->base, -1, EV_PERSIST,
                     handler_core, ctx );
       add_ev_ctx( ctx, &ctx->handle.u.timer_val.interval );
@@ -513,6 +520,11 @@ handler_core( int fd, short flags, void *arg )
       memset( &ctx->handle.u.timer_val.interval, 0,
               sizeof( ctx->handle.u.timer_val.interval ) );
     }
+
+    if ( !(ctx->hd.state & CTX_STATE_ADDED_EV) )
+      destroy_event_handle(&ctx->handle);
+
+    cb( cb_arg );
   }
   else if ( flags & EV_SIGNAL ) {
     void (*cb)( int ) = ctx->handle.u.signal_val.signal_cb;
@@ -534,8 +546,10 @@ handler_core( int fd, short flags, void *arg )
     CACHE_CLEAR( ctx->hd.base );
   }
   ctx->hd.cur_flags = 0;
+
+  int cnt = ctx->hd.refcnt - 1;
+  TRACE( "<----------- end fd:%d state:%x cnt:%d", fd, ctx->hd.state, cnt );
   detach_ctx( ctx );
-  TRACE( "<--- end fd:%d", fd );
 }
 
 /***************************************************************************
@@ -612,7 +626,7 @@ run_event_handler_once_raw( ev_base_t *ev_base, suseconds_t usec )
   return ret;
 }
 
-#if 0                           /* not implemented */
+#if 0  /* not implemented */
 static bool
 run_event_handler_once_r( int timeout_usec )
 {
@@ -729,8 +743,10 @@ set_fd_handler_raw( ev_base_t *ev_base,
                                                     read_cb, read_d,
                                                     write_cb, write_d );
   if ( handle ) {
+#if 0
     ctx_t *ctx = container_of( handle, ctx_t, handle );
     detach_ctx( ctx );
+#endif
     return true;
   }
   return false;
@@ -1062,7 +1078,7 @@ static inline void
 timespec2timeval( struct timeval *tv, const struct timespec *ts )
 {
   tv->tv_sec = ts->tv_sec;
-  tv->tv_usec = ts->tv_nsec * 1000;
+  tv->tv_usec = ts->tv_nsec / 1000;
 }
 
 #define VALID_TS(_a) (((_a)->tv_sec > 0 || (_a)->tv_nsec > 0) ? 1 : 0)
@@ -1079,6 +1095,8 @@ create_timer_handle_raw( ev_base_t *ev_base,
   short flags = 0;
   if ( !ctx )
     return NULL;
+
+  TRACE("cb:%p arg:%p", cb, arg);
 
   ctx->handle.u.timer_val.timer_cb = cb;
   ctx->handle.u.timer_val.timer_data = arg;
@@ -1131,11 +1149,17 @@ add_timer_event_callback_raw( ev_base_t *ev_base,
     timespec2timeval( &it_tm, &interval->it_interval );
     it_tm_p = &it_tm;
   }
-  if ( !it_tm_p && !tm_p )
-    return false;
+  if ( !it_tm_p && !tm_p ) {
+    tm_p = &tm;
+    memset(tm_p, 0, sizeof(tm));
+  }
 
   handle = create_timer_handle_raw( ev_base, tm_p, it_tm_p, cb, arg );
   if ( handle ) {
+#if 0
+    ctx_t *ctx = container_of( handle, ctx_t, handle );
+    detach_ctx( ctx );
+#endif
     return true;
   }
   return false;
@@ -1192,6 +1216,8 @@ delete_timer_event_raw( ev_base_t *ev_base,
                         timer_callback cb, void *arg )
 {
   ctx_t *ctx = find_ctx_tm( ev_base, cb, arg );
+
+  TRACE("cb:%p arg:%p", cb, arg);
 
   if ( ctx ) {
     destroy_event_handle( &ctx->handle );
