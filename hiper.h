@@ -3,7 +3,10 @@
 
 #include <stdio.h>
 #include <event.h>
+#include <stdbool.h>
 #include <curl/curl.h>
+
+#include <trema.h>
 
 # if 1
 #  include <stdlib.h>
@@ -17,6 +20,27 @@
 #define	MALLOC(_s)	malloc((_s))
 #define	FREE(_p)	free((_p))
 
+enum {
+  HTTP_METHOD_INVALID = 0,
+
+  HTTP_METHOD_GET,
+  HTTP_METHOD_POST,
+  HTTP_METHOD_PUT,
+  HTTP_METHOD_DELETE,
+
+  HTTP_METHOD_NUM,
+};
+
+enum {
+  HTTP_TRANSACTION_FAILED = 0,
+  HTTP_TRANSACTION_SUCCEEDED = 1,
+};
+
+typedef struct {
+  char *type;
+  buffer *body;
+} http_content_t;
+
 
 /* HTTP client thread info */
 typedef struct {
@@ -26,6 +50,9 @@ typedef struct {
 } http_th_info_t;
 
 
+typedef void (*http_resp_handler)(int status, int code,
+                                  const http_content_t *content, void *cb_arg);
+
 typedef struct {
   CURL *easy;
   http_th_info_t *th_info;
@@ -33,15 +60,99 @@ typedef struct {
   curl_socket_t sock;
   int action;
 
-  char url[1024];
+  int method;
+  int status;
+  int code;
+  http_content_t *request;
+  http_content_t *response;
+  struct curl_slist *slist;
+
+  http_resp_handler cb;
+  void *arg;
+
+  char *url;
   char error[CURL_ERROR_SIZE];
 } http_transaction_t;
+
+
+
+static inline void *
+STRDUP(const char *s)
+{
+  size_t len = strlen(s) + 1;
+  char *p = MALLOC(len);
+
+  if (p)
+    memcpy(p, s, len);
+  return p;
+}
+
+static inline void
+free_http_content(http_content_t *content)
+{
+  if (content) {
+    if (content->type) {
+      FREE(content->type);
+      content->type = NULL;
+    }
+
+    if (content->body) {
+      free_buffer(content->body);
+      content->body = NULL;
+    }
+    FREE(content);
+  }
+}
+
+static inline http_content_t *
+alloc_http_content(const char *type,
+                   const buffer *body)
+{
+  http_content_t *content = MALLOC(sizeof(*content));
+
+  if (content) {
+    content->body = NULL;
+    content->type = NULL;
+
+    if (type) {
+      if ((content->type = STRDUP(type)) == NULL) {
+        free_http_content(content);
+        content = NULL;
+        goto end;
+      }
+    }
+    if (body) {
+      if ((content->body = duplicate_buffer(body)) == NULL) {
+        free_http_content(content);
+        content = NULL;
+        goto end;
+      }
+    }
+  }
+ end:
+  return content;
+}
+
+
+
+
 
 extern void destroy_http_th(http_th_info_t *th_info);
 extern http_th_info_t *create_http_th(void);
 
 extern http_transaction_t *create_http_transaction(http_th_info_t *th_info,
                                                    const char *url);
+
+
 extern void destroy_http_transaction(http_transaction_t *trans);
+
+extern bool do_http_request( int method,
+                             const char *uri,
+                             const http_content_t *content,
+                             http_resp_handler cb,
+                             void *cb_arg );
+extern bool init_http_client(void);
+extern bool finalize_http_client(void);
+
 
 #endif	/* !_HIPER_H_ */

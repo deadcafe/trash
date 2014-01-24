@@ -21,11 +21,38 @@
  * FIFO
  ****************************************************************************/
 typedef struct {
-  http_th_info_t *th_info;
   FILE* input;
   int sock;
 } fifo_info_t;
 
+
+static void
+dump(const char *fmt, ...)
+{
+  va_list ap;
+
+  va_start(ap, fmt);
+  vfprintf(stderr, fmt, ap);
+  va_end(ap);
+}
+
+static void
+resp(int status,
+     int code,
+     const http_content_t *content,
+     void *arg __attribute__((unused)))
+{
+  TRACE("status:%d code:%d", status, code);
+
+  if (content) {
+    if (content->type)
+    TRACE("type: %s", content->type);
+    if (content->body) {
+      dump_buffer(content->body, dump);
+      fputs(content->body->data, stderr);
+    }
+  }
+}
 
 /* This gets called whenever data is received from the fifo */
 static void
@@ -42,7 +69,7 @@ fifo_cb(int sock __attribute__((unused)),
     rv = fscanf(fifo->input, "%1023s%n", s, &n);
     s[n] = '\0';
     if (n && s[0]) {
-      create_http_transaction(fifo->th_info, s);
+      do_http_request( HTTP_METHOD_GET, s, NULL, resp, NULL);
     } else
       break;
   } while (rv != EOF);
@@ -64,7 +91,7 @@ destroy_fifo_info(fifo_info_t *fifo)
 }
 
 static fifo_info_t *
-create_fifo_info(http_th_info_t *th_info)
+create_fifo_info(void)
 {
   fifo_info_t *fifo;
 
@@ -73,8 +100,6 @@ create_fifo_info(http_th_info_t *th_info)
 
     struct stat st;
     int sock;
-
-    fifo->th_info = th_info;
 
     TRACE("Creating named pipe \"%s\"", FIFO);
     if (lstat(FIFO, &st) == 0) {
@@ -120,7 +145,6 @@ create_fifo_info(http_th_info_t *th_info)
 int
 main(int ac, char **av)
 {
-  http_th_info_t *th_info;
   fifo_info_t *fifo;
   int opt;
 
@@ -140,13 +164,13 @@ main(int ac, char **av)
   init_timer();
   init_signal_handler();
 
-  th_info = create_http_th();
-  fifo = create_fifo_info(th_info);
+  init_http_client();
+  fifo = create_fifo_info();
 
   start_event_handler();
 
   destroy_fifo_info(fifo);
-  destroy_http_th(th_info);
+  finalize_http_client();
 
   finalize_signal_handler();
   finalize_timer();

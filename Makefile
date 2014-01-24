@@ -9,7 +9,7 @@ TREMA_INC = ../spot/src/lib
 TREMA_LIB = ../spot/objects/lib
 
 CPPFLAGS = -c -std=gnu99 -D_GNU_SOURCE -I$(TREMA_INC)
-LDFLAGS = -L$(TREMA_LIB) -ltrema $(shell curl-config --libs)
+LDFLAGS = -L$(TREMA_LIB) -ltrema $(shell curl-config --libs) -lpthread
 
 
 
