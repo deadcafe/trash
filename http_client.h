@@ -1,18 +1,17 @@
-#ifndef _HIPER_H_
-#define	_HIPER_H_
+#ifndef _HTTP_CLIENT_H_
+#define _HTTP_CLIENT_H_
 
+#include <sys/queue.h>
 #include <stdio.h>
 #include <event.h>
 #include <stdbool.h>
 #include <pthread.h>
-
 #include <curl/curl.h>
 
 #include <trema.h>
-
 #include "func_queue.h"
 
-# if 1
+# if 0
 #  include <stdlib.h>
 #  include <syslog.h>
 #  define _log(pri_,fmt_,...)     fprintf(stdout,fmt_,##__VA_ARGS__)
@@ -20,9 +19,6 @@
 #  define TRACE(fmt_,...)         LOG(LOG_DEBUG,fmt_,##__VA_ARGS__)
 
 # endif
-
-#define	MALLOC(_s)	malloc((_s))
-#define	FREE(_p)	free((_p))
 
 enum {
   HTTP_METHOD_INVALID = 0,
@@ -49,7 +45,7 @@ typedef struct {
 /* HTTP client thread info */
 typedef struct {
   long response_timeout;		/* msec */
-  long connect_timeout;		/* msec */
+  long connect_timeout;			/* msec */
 
   CURLM *multi;
   int running;
@@ -64,7 +60,7 @@ typedef void (*http_resp_handler)(int status, int code,
                                   const http_content_t *content, void *cb_arg);
 
 
-typedef struct {
+typedef struct _http_transaction_t {
   CURL *easy;
   http_th_info_t *th_info;
 
@@ -72,8 +68,6 @@ typedef struct {
   int action;
 
   int method;
-  int status;
-  int code;
   http_content_t *request;
   struct {
     http_content_t *content;
@@ -91,62 +85,8 @@ typedef struct {
 } http_transaction_t;
 
 
-static inline void *
-STRDUP(const char *s)
-{
-  size_t len = strlen(s) + 1;
-  char *p = MALLOC(len);
 
-  if (p)
-    memcpy(p, s, len);
-  return p;
-}
 
-static inline void
-free_http_content(http_content_t *content)
-{
-  if (content) {
-    if (content->type) {
-      FREE(content->type);
-      content->type = NULL;
-    }
-
-    if (content->body) {
-      free_buffer(content->body);
-      content->body = NULL;
-    }
-    FREE(content);
-  }
-}
-
-static inline http_content_t *
-alloc_http_content(const char *type,
-                   const buffer *body)
-{
-  http_content_t *content = MALLOC(sizeof(*content));
-
-  if (content) {
-    content->body = NULL;
-    content->type = NULL;
-
-    if (type) {
-      if ((content->type = STRDUP(type)) == NULL) {
-        free_http_content(content);
-        content = NULL;
-        goto end;
-      }
-    }
-    if (body) {
-      if ((content->body = duplicate_buffer(body)) == NULL) {
-        free_http_content(content);
-        content = NULL;
-        goto end;
-      }
-    }
-  }
- end:
-  return content;
-}
 
 extern bool do_http_request( int method,
                              const char *uri,
@@ -155,6 +95,6 @@ extern bool do_http_request( int method,
                              void *cb_arg );
 extern bool init_http_client(long response_to, long connect_to);
 extern bool finalize_http_client(void);
+extern bool stop_http_client(void);
 
-
-#endif	/* !_HIPER_H_ */
+#endif	/* !_HTTP_CLIENT_H_ */

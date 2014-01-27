@@ -17,6 +17,19 @@
 #include "http_client.h"
 
 
+# if 1
+#  include <stdlib.h>
+#  include <syslog.h>
+#  define _log(pri_,fmt_,...)     fprintf(stdout,fmt_,##__VA_ARGS__)
+#  define LOG(pri_,fmt_,...)      _log((pri_),"%s:%d:%s() " fmt_ "\n", __FILE__,__LINE__,__func__, ##__VA_ARGS__)
+#  define TRACE(fmt_,...)         LOG(LOG_DEBUG,fmt_,##__VA_ARGS__)
+# endif
+
+
+#define	FREE(_p)	xfree((_p))
+#define	MALLOC(_s)	xmalloc((_s))
+
+
 /*****************************************************************************
  * FIFO
  ****************************************************************************/
@@ -55,6 +68,24 @@ resp(int status,
   }
 }
 
+/* Create a named pipe and tell libevent to monitor it */
+static const char *FIFO = ".hiper.fifo";
+
+static void
+destroy_fifo_info(fifo_info_t *fifo)
+{
+  if (fifo) {
+    TRACE("");
+    if (fifo->input) {
+      delete_fd_handler_safe(fifo->sock);
+      fclose(fifo->input);
+    }
+    FREE(fifo);
+  }
+  unlink(FIFO);
+}
+
+
 /* This gets called whenever data is received from the fifo */
 static void
 fifo_cb(int sock __attribute__((unused)),
@@ -70,29 +101,21 @@ fifo_cb(int sock __attribute__((unused)),
     rv = fscanf(fifo->input, "%1023s%n", s, &n);
     s[n] = '\0';
     if (n && s[0]) {
-      do_http_request( HTTP_METHOD_GET, s, NULL, resp, NULL);
+
+      if (strcmp(s, "exit")) {
+        do_http_request( HTTP_METHOD_GET, s, NULL, resp, NULL);
+      } else {
+        stop_http_client();
+        stop_event_handler_safe();
+        delete_fd_handler_safe(sock);
+        return;
+      }
     } else
       break;
     TRACE("=======================================================");
   } while (rv != EOF);
 }
 
-
-/* Create a named pipe and tell libevent to monitor it */
-static const char *FIFO = ".hiper.fifo";
-
-static void
-destroy_fifo_info(fifo_info_t *fifo)
-{
-  if (fifo) {
-    if (fifo->input) {
-      fclose(fifo->input);
-      delete_fd_handler_safe(fifo->sock);
-    }
-    FREE(fifo);
-  }
-  unlink(FIFO);
-}
 
 static fifo_info_t *
 create_fifo_info(void)
@@ -149,8 +172,8 @@ create_fifo_info(void)
 int
 main(int ac, char **av)
 {
-  fifo_info_t *fifo;
   int opt;
+  fifo_info_t *fifo;
 
   while ((opt = getopt(ac, av, "p")) != -1) {
     switch (opt) {
@@ -170,11 +193,13 @@ main(int ac, char **av)
   init_signal_handler();
 
   init_http_client(10L, 5L);
+
   fifo = create_fifo_info();
 
   start_event_handler_safe();
-
+  TRACE("stopping main thread");
   destroy_fifo_info(fifo);
+
   finalize_http_client();
 
   finalize_signal_handler();

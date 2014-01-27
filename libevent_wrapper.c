@@ -20,7 +20,7 @@
 #define USE_REDBLACK 1
 #define ENABLE_CAHCE 1
 
-#if 0
+#if 1
 # include <stdlib.h>
 # include <syslog.h>
 # define _log(pri_,fmt_,...)     fprintf(stdout,fmt_,##__VA_ARGS__)
@@ -665,6 +665,7 @@ stop_event_handler_raw( ev_base_t *ev_base )
 {
   TRACE( "" );
   ev_base->state = BASE_STATE_STOP;
+  event_base_loopbreak(ev_base->base);
 }
 
 static void

@@ -17,6 +17,16 @@
 #include "memory_barrier.h"
 #include "func_queue.h"
 
+
+# if 1
+#  include <stdlib.h>
+#  include <syslog.h>
+#  define _log(pri_,fmt_,...)     fprintf(stdout,fmt_,##__VA_ARGS__)
+#  define LOG(pri_,fmt_,...)      _log((pri_),"%s:%d:%s() " fmt_ "\n", __FILE__,__LINE__,__func__, ##__VA_ARGS__)
+#  define TRACE(fmt_,...)         LOG(LOG_DEBUG,fmt_,##__VA_ARGS__)
+# endif
+
+
 #define	WMB()	write_memory_barrier()
 #define	RMB()	read_memory_barrier()
 
@@ -53,7 +63,7 @@ CLOSE(int fd)
 static bool
 wakeup(func_q_info_t *info)
 {
-  if (writable_safe(info->fd)) {
+  if (info->val) {
     int err = 0;
 
     while (!err && info->val) {
@@ -73,11 +83,6 @@ wakeup(func_q_info_t *info)
         set_writable_safe(info->fd, false);
       }
     }
-  } else {
-    if (info->val)
-      set_writable_safe(info->fd, true);
-    else
-      set_writable_safe(info->fd, false);
   }
   return true;
 }
@@ -100,9 +105,11 @@ read_cb(int fd,
     }
   }
 
-  while ((msg = dequeue(info->queue)) != NULL) {
-    msg->cb(msg->arg);
-    FREE(msg);
+  if (info->queue) {
+    while ((msg = dequeue(info->queue)) != NULL) {
+      msg->cb(msg->arg);
+      FREE(msg);
+    }
   }
 }
 
@@ -199,31 +206,32 @@ func_q_unbind(func_q_t *func_q,
               func_q_dir_t dir)
 {
   assert(dir == DIR_TO_UP || dir == DIR_TO_DOWN);
+
+  TRACE("dir:%d", dir);
+
   func_q_info_t *info = (&func_q->info[dir]);
   int fd = info->fd;
   int another_fd = info->another->fd;
-  queue *queue = info->queue;
+  queue *queue = info->another->queue;
   func_q_msg_t *msg;
 
   RMB();
   *info->state_p = STATE_INVALID;
-  info->queue = NULL;
+  info->another->queue = NULL;
   info->val = 0;
   WMB();
 
-  set_readable_safe(fd, false);
-  set_writable_safe(fd, false);
   delete_fd_handler_safe(fd);
-
-  set_readable_safe(another_fd, false);
-  set_writable_safe(another_fd, false);
   delete_fd_handler_safe(another_fd);
 
-  while ((msg = dequeue(queue)) != NULL) {
-    msg->cb(msg->arg);
-    FREE(msg);
+  if (queue) {
+    while ((msg = dequeue(queue)) != NULL) {
+      msg->cb(msg->arg);
+      FREE(msg);
+    }
+    delete_queue(queue);
+    TRACE("deleted q:%p", queue);
   }
-  delete_queue(queue);
 }
 
 
@@ -235,6 +243,8 @@ func_q_destroy( func_q_t *func_q )
 {
   int i;
   assert(func_q->state == STATE_INVALID);
+
+  TRACE("q:%p", func_q);
 
   for (i = 0; i < DIR_NUM; i++) {
     assert(func_q->info[i].queue == NULL);
@@ -273,6 +283,7 @@ func_q_create( void )
       return NULL;
     }
     func_q->info[DIR_TO_DOWN].fd = fd;
+    TRACE("q:%p", func_q);
   }
   return func_q;
 }

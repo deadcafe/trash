@@ -15,9 +15,80 @@
 
 #include "http_client.h"
 
+#define	FREE(_p)	xfree((_p))
+#define	MALLOC(_s)	xmalloc((_s))
+
+# if 1
+#  include <stdlib.h>
+#  include <syslog.h>
+#  define _log(pri_,fmt_,...)     fprintf(stdout,fmt_,##__VA_ARGS__)
+#  define LOG(pri_,fmt_,...)      _log((pri_),"%s:%d:%s() " fmt_ "\n", __FILE__,__LINE__,__func__, ##__VA_ARGS__)
+#  define TRACE(fmt_,...)         LOG(LOG_DEBUG,fmt_,##__VA_ARGS__)
+# endif
+
 
 static void clean_completed_http_transaction(http_th_info_t *th_info);
 static void reply_handler(void *arg);
+
+
+static inline void *
+STRDUP(const char *s)
+{
+  size_t len = strlen(s) + 1;
+  char *p = MALLOC(len);
+
+  if (p)
+    memcpy(p, s, len);
+  return p;
+}
+
+
+static inline void
+free_http_content(http_content_t *content)
+{
+  if (content) {
+    if (content->type) {
+      FREE(content->type);
+      content->type = NULL;
+    }
+
+    if (content->body) {
+      free_buffer(content->body);
+      content->body = NULL;
+    }
+    FREE(content);
+  }
+}
+
+
+static inline http_content_t *
+alloc_http_content(const char *type,
+                   const buffer *body)
+{
+  http_content_t *content = MALLOC(sizeof(*content));
+
+  if (content) {
+    content->body = NULL;
+    content->type = NULL;
+
+    if (type) {
+      if ((content->type = STRDUP(type)) == NULL) {
+        free_http_content(content);
+        content = NULL;
+        goto end;
+      }
+    }
+    if (body) {
+      if ((content->body = duplicate_buffer(body)) == NULL) {
+        free_http_content(content);
+        content = NULL;
+        goto end;
+      }
+    }
+  }
+ end:
+  return content;
+}
 
 
 #define EASY_SETOPT(_e, _o, _p) {                       \
@@ -209,10 +280,10 @@ clean_completed_http_transaction(http_th_info_t *th_info)
 
       if (curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &code) == CURLE_OK) {
         TRACE("code:%d", code);
-        trans->code = code;
+        trans->response.code = code;
 
         if (code >= 200 && code < 300)
-          trans->status = HTTP_TRANSACTION_SUCCEEDED;
+          trans->response.status = HTTP_TRANSACTION_SUCCEEDED;
 
         if (curl_easy_getinfo(easy, CURLINFO_CONTENT_TYPE, &type) ==  CURLE_OK) {
           if (type)
@@ -336,8 +407,6 @@ update_http_transaction_handler(CURL *easy,
 }
 
 
-
-
 static size_t
 read_from_buffer( void *ptr,
                   size_t size,
@@ -410,7 +479,9 @@ http_client_th_entry( void *arg )
 
   pthread_barrier_wait(&th_info->barrier);
 
+  TRACE("start http client thread");
   start_event_handler_safe();
+  TRACE("ending http client thread");
 
   finalize_timer_safe();
   finalize_event_handler_safe();
@@ -448,8 +519,10 @@ stop_http_thread(void *arg)
   http_th_info_t *th_info = arg;
 
   if (th_info) {
+    TRACE("stoping thread");
     stop_event_handler_safe();
     func_q_unbind(th_info->func_q, DIR_TO_UP);
+    /* XXX: leak transaction */
   }
 }
 
@@ -461,6 +534,8 @@ static void
 destroy_http_th(http_th_info_t *th_info)
 {
   if (th_info) {
+    TRACE("th_info:%p", th_info);
+
     pthread_barrier_destroy(&th_info->barrier);
 
     if (th_info->timer) {
@@ -469,6 +544,7 @@ destroy_http_th(http_th_info_t *th_info)
     }
 
     if (th_info->func_q) {
+      TRACE("func_q:%p", th_info->func_q);
       func_q_destroy(th_info->func_q);
       th_info->func_q = NULL;
     }
@@ -551,14 +627,33 @@ bool
 finalize_http_client(void)
 {
   if (HTTP_THREAD_INFO) {
-    func_q_request(HTTP_THREAD_INFO->func_q, DIR_TO_UP,
-                   stop_http_thread, HTTP_THREAD_INFO);
-
-    pthread_barrier_wait(&HTTP_THREAD_INFO->barrier);
-    func_q_unbind(HTTP_THREAD_INFO->func_q, DIR_TO_DOWN);
-
-    destroy_http_th(HTTP_THREAD_INFO);
+    http_th_info_t *th_info = HTTP_THREAD_INFO;
     HTTP_THREAD_INFO = NULL;
+
+    pthread_barrier_destroy(&th_info->barrier);
+    pthread_barrier_init(&th_info->barrier, NULL, 2);
+
+    TRACE("waiting http thread");
+    pthread_barrier_wait(&th_info->barrier);
+    TRACE("done http thread");
+
+    func_q_unbind(th_info->func_q, DIR_TO_DOWN);
+    destroy_http_th(th_info);
+
+    return true;
+  }
+  return false;
+}
+
+
+bool
+stop_http_client(void)
+{
+  if (HTTP_THREAD_INFO) {
+    http_th_info_t *th_info = HTTP_THREAD_INFO;
+
+    TRACE("request stop http thread");
+    func_q_request(th_info->func_q, DIR_TO_UP, stop_http_thread, th_info);
     return true;
   }
   return false;
@@ -607,7 +702,8 @@ do_http_request( int method,
 
     EASY_SETOPT(trans->easy, CURLOPT_TCP_NODELAY, 1L);
     EASY_SETOPT(trans->easy, CURLOPT_TIMEOUT, trans->th_info->response_timeout);
-    EASY_SETOPT(trans->easy, CURLOPT_CONNECTTIMEOUT, trans->th_info->connect_timeout);
+    EASY_SETOPT(trans->easy, CURLOPT_CONNECTTIMEOUT,
+                trans->th_info->connect_timeout);
 
     EASY_SETOPT(trans->easy, CURLOPT_USERAGENT, USER_AGENT );
     EASY_SETOPT(trans->easy, CURLOPT_URL, trans->url);
@@ -618,7 +714,6 @@ do_http_request( int method,
 
     EASY_SETOPT(trans->easy, CURLOPT_ERRORBUFFER, trans->error);
     EASY_SETOPT(trans->easy, CURLOPT_PRIVATE, trans);
-
 
     switch (method) {
     case HTTP_METHOD_GET:
