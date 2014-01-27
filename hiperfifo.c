@@ -32,7 +32,7 @@ dump(const char *fmt, ...)
   va_list ap;
 
   va_start(ap, fmt);
-  vfprintf(stderr, fmt, ap);
+  //  vfprintf(stderr, fmt, ap);
   va_end(ap);
 }
 
@@ -47,9 +47,10 @@ resp(int status,
   if (content) {
     if (content->type)
     TRACE("type: %s", content->type);
+
     if (content->body) {
       dump_buffer(content->body, dump);
-      fputs(content->body->data, stderr);
+      //      fputs(content->body->data, stderr);
     }
   }
 }
@@ -72,6 +73,7 @@ fifo_cb(int sock __attribute__((unused)),
       do_http_request( HTTP_METHOD_GET, s, NULL, resp, NULL);
     } else
       break;
+    TRACE("=======================================================");
   } while (rv != EOF);
 }
 
@@ -83,8 +85,10 @@ static void
 destroy_fifo_info(fifo_info_t *fifo)
 {
   if (fifo) {
-    if (fifo->input)
+    if (fifo->input) {
       fclose(fifo->input);
+      delete_fd_handler_safe(fifo->sock);
+    }
     FREE(fifo);
   }
   unlink(FIFO);
@@ -124,9 +128,9 @@ create_fifo_info(void)
     fifo->input = fdopen(sock, "r");
     fifo->sock = sock;
 
-    set_fd_handler(sock, fifo_cb, fifo, NULL, NULL);
-    set_readable(sock, true);
-    set_writable(sock, false);
+    set_fd_handler_safe(sock, fifo_cb, fifo, NULL, NULL);
+    set_readable_safe(sock, true);
+    set_writable_safe(sock, false);
 
     TRACE("Now, pipe some URL's into > %s", FIFO);
 
@@ -160,22 +164,25 @@ main(int ac, char **av)
   }
 
   init_libevent_wrapper( xmalloc, NULL, xfree, 0 );
-  init_event_handler();
-  init_timer();
+
+  init_event_handler_safe();
+  init_timer_safe();
   init_signal_handler();
 
-  init_http_client();
+  init_http_client(10L, 5L);
   fifo = create_fifo_info();
 
-  start_event_handler();
+  start_event_handler_safe();
 
   destroy_fifo_info(fifo);
   finalize_http_client();
 
   finalize_signal_handler();
-  finalize_timer();
-  finalize_event_handler();
+  finalize_timer_safe();
+  finalize_event_handler_safe();
+
   finalize_libevent_wrapper();
+
   fprintf(stderr, "END\n");
   return 0;
 }

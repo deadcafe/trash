@@ -20,11 +20,11 @@
 #define USE_REDBLACK 1
 #define ENABLE_CAHCE 1
 
-#if 1
+#if 0
 # include <stdlib.h>
 # include <syslog.h>
 # define _log(pri_,fmt_,...)     fprintf(stdout,fmt_,##__VA_ARGS__)
-# define LOG(pri_,fmt_,...)      _log((pri_),"%s:%d:%s " fmt_ "\n", __FILE__,__LINE__,__func__, ##__VA_ARGS__)
+# define LOG(pri_,fmt_,...)      _log((pri_),"%s:%d:%s() " fmt_ "\n", __FILE__,__LINE__,__func__, ##__VA_ARGS__)
 # define TRACE(fmt_,...)         LOG(LOG_DEBUG,fmt_,##__VA_ARGS__)
 
 #else
@@ -179,7 +179,7 @@ create_ev_base( pthread_key_t *key, suseconds_t usec )
     ev_base->refcnt = 1;
     ev_base->thread = pthread_self();
   }
-  TRACE( "base:%p", ev_base );
+  //  TRACE( "base:%p", ev_base );
   return ev_base;
 }
 
@@ -194,7 +194,7 @@ free_ev_base( ev_base_t *ev_base )
     event_base_free( ev_base->base );
     ev_base->base = NULL;
   }
-  TRACE( "base:%p", ev_base );
+  //  TRACE( "base:%p", ev_base );
   FREE( ev_base );
 }
 
@@ -202,14 +202,14 @@ static void
 attach_base( ev_base_t *ev_base )
 {
   ev_base->refcnt++;
-  TRACE( "base:%p cnt:%d", ev_base, ev_base->refcnt );
+  //  TRACE( "base:%p cnt:%d", ev_base, ev_base->refcnt );
 }
 
 static void
 detach_base( ev_base_t *ev_base )
 {
   ev_base->refcnt--;
-  TRACE( "base:%p cnt:%d", ev_base, ev_base->refcnt );
+  //  TRACE( "base:%p cnt:%d", ev_base, ev_base->refcnt );
   if ( !ev_base->refcnt )
     free_ev_base( ev_base );
 }
@@ -217,7 +217,7 @@ detach_base( ev_base_t *ev_base )
 static void
 destroy_ev_base( ev_base_t *ev_base )
 {
-  TRACE( "base:%p", ev_base );
+  //  TRACE( "base:%p", ev_base );
 
   ev_base->state = BASE_STATE_INVALID;
   CACHE_CLEAR( ev_base );
@@ -376,14 +376,9 @@ find_ctx_cache( ev_base_t *ev_base, ctx_t *key )
 {
 #ifdef ENABLE_CACHE
   if ( ev_base->cache_ctx ) {
-    if ( !cmp_ctx( key, ev_base->cache_ctx ) ) {
-      TRACE( "cache hit ctx:%p type:%d fd:%d",
-             ev_base->cache_ctx, ev_base->cache_ctx->handle.type,
-             ev_base->cache_ctx->handle.fd );
+    if ( !cmp_ctx( key, ev_base->cache_ctx ) )
       return ev_base->cache_ctx;
-    }
   }
-  TRACE( "cache mis" );
 #endif /* ENABLE_CACHE */
   return TREE_FIND( ctx_db, &ev_base->head, key );
 }
@@ -423,8 +418,7 @@ add_db_ctx( ctx_t *ctx )
   old = TREE_INSERT( ctx_db, &ev_base->head, ctx );
   assert( !old );
   attach_ctx( ctx );
-  TRACE( "fd:%d cnt:%d state:%x", ctx->handle.fd, ctx->hd.refcnt,
-         ctx->hd.state );
+  TRACE( "fd:%d cnt:%d state:%x", ctx->handle.fd, ctx->hd.refcnt, ctx->hd.state );
 }
 
 static inline void
@@ -435,8 +429,7 @@ del_db_ctx( ctx_t *ctx )
   if ( ctx->hd.state & CTX_STATE_ADDED_DB ) {
     ctx->hd.state &= ~CTX_STATE_ADDED_DB;
     TREE_REMOVE( ctx_db, &ev_base->head, ctx );
-    TRACE( "fd:%d cnt:%d state:%x", ctx->handle.fd, ctx->hd.refcnt,
-           ctx->hd.state );
+    TRACE( "fd:%d cnt:%d state:%x", ctx->handle.fd, ctx->hd.refcnt, ctx->hd.state );
     detach_ctx( ctx );
   }
 }
@@ -458,10 +451,8 @@ clear_db_all_ctx( ev_base_t *ev_base )
 {
   ctx_t *ctx;
 
-  TRACE( "base:%p", ev_base );
-  while ( ( ctx = TREE_ROOT( &ev_base->head ) ) != NULL ) {
+  while ( ( ctx = TREE_ROOT( &ev_base->head ) ) != NULL )
     destroy_event_handle( &ctx->handle );
-  }
 }
 
 static inline void
@@ -484,8 +475,7 @@ add_ev_ctx( ctx_t *ctx, const struct timeval *tm )
     return false;
   ctx->hd.state |= CTX_STATE_ADDED_EV;
   attach_ctx( ctx );
-  TRACE( "fd:%d cnt:%d state:%x",
-         ctx->handle.fd, ctx->hd.refcnt, ctx->hd.state );
+  TRACE( "fd:%d cnt:%d state:%x", ctx->handle.fd, ctx->hd.refcnt, ctx->hd.state );
   return true;
 }
 
@@ -497,7 +487,7 @@ handler_core( int fd, short flags, void *arg )
 {
   ctx_t *ctx = arg;
 
-  TRACE( "start fd:%d flags:%x state:%x --->", fd, flags, ctx->hd.state );
+  TRACE( "start fd:%d flags:%x state:%x --------->", fd, flags, ctx->hd.state );
   assert( ctx && ctx->handle.fd == fd );
 
   attach_ctx( ctx );
@@ -517,12 +507,13 @@ handler_core( int fd, short flags, void *arg )
                     handler_core, ctx );
       add_ev_ctx( ctx, &ctx->handle.u.timer_val.interval );
       ctx->handle.flags = EV_PERSIST;
-      memset( &ctx->handle.u.timer_val.interval, 0,
-              sizeof( ctx->handle.u.timer_val.interval ) );
+      memset( &ctx->handle.u.timer_val.interval, 0, sizeof( ctx->handle.u.timer_val.interval ) );
     }
 
-    if ( !(ctx->hd.state & CTX_STATE_ADDED_EV) )
+    if ( !(ctx->hd.state & CTX_STATE_ADDED_EV) ) {
+      TRACE("<<<timer is expired and clear>>>");
       destroy_event_handle(&ctx->handle);
+    }
 
     cb( cb_arg );
   }
@@ -547,7 +538,8 @@ handler_core( int fd, short flags, void *arg )
   }
   ctx->hd.cur_flags = 0;
 
-  int cnt = ctx->hd.refcnt - 1;
+  int cnt __attribute__((unused));
+  cnt = ctx->hd.refcnt - 1;
   TRACE( "<----------- end fd:%d state:%x cnt:%d", fd, ctx->hd.state, cnt );
   detach_ctx( ctx );
 }
@@ -602,14 +594,12 @@ finalize_event_handler_x( void )
 static bool
 run_event_handler_once_raw( ev_base_t *ev_base, suseconds_t usec )
 {
-  TRACE( "start --->" );
   bool ret = true;
 
   if ( ev_base->ext_cb ) {
     external_callback_t cb = ev_base->ext_cb;
     ev_base->ext_cb = NULL;
     cb(  );
-    TRACE( "done extern callback:%p", cb );
   }
 
   if ( ev_base->tick ) {
@@ -622,7 +612,6 @@ run_event_handler_once_raw( ev_base_t *ev_base, suseconds_t usec )
   /* block */
   if ( event_base_loop( ev_base->base, EVLOOP_ONCE ) < 0 )
     ret = false;
-  TRACE( "<--- end %d", ret );
   return ret;
 }
 
@@ -742,13 +731,8 @@ set_fd_handler_raw( ev_base_t *ev_base,
   event_handle_t *handle = create_event_handle_raw( ev_base, fd,
                                                     read_cb, read_d,
                                                     write_cb, write_d );
-  if ( handle ) {
-#if 0
-    ctx_t *ctx = container_of( handle, ctx_t, handle );
-    detach_ctx( ctx );
-#endif
+  if ( handle )
     return true;
-  }
   return false;
 }
 
@@ -1156,10 +1140,6 @@ add_timer_event_callback_raw( ev_base_t *ev_base,
 
   handle = create_timer_handle_raw( ev_base, tm_p, it_tm_p, cb, arg );
   if ( handle ) {
-#if 0
-    ctx_t *ctx = container_of( handle, ctx_t, handle );
-    detach_ctx( ctx );
-#endif
     return true;
   }
   return false;
@@ -1169,6 +1149,7 @@ static bool
 add_timer_event_callback_r( struct itimerspec *interval,
                             timer_callback cb, void *arg )
 {
+  TRACE( "%p:%p", cb, arg );
   return add_timer_event_callback_raw( get_ev_base( SAFE ), interval, cb, arg );
 }
 
@@ -1176,6 +1157,7 @@ static bool
 add_timer_event_callback_x( struct itimerspec *interval,
                             timer_callback cb, void *arg )
 {
+  TRACE( "%p:%p", cb, arg );
   return add_timer_event_callback_raw( Base, interval, cb, arg );
 }
 
@@ -1198,6 +1180,7 @@ static inline bool
 add_periodic_event_callback_r( const time_t sec,
                                timer_callback cb, void *arg )
 {
+  TRACE( "%p:%p", cb, arg );
   return add_periodic_event_callback_raw( get_ev_base( SAFE ), sec, cb, arg );
 }
 
@@ -1205,6 +1188,7 @@ static bool
 add_periodic_event_callback_x( const time_t sec,
                                timer_callback cb, void *arg )
 {
+  TRACE( "%p:%p", cb, arg );
   return add_periodic_event_callback_raw( Base, sec, cb, arg );
 }
 
@@ -1218,23 +1202,26 @@ delete_timer_event_raw( ev_base_t *ev_base,
   ctx_t *ctx = find_ctx_tm( ev_base, cb, arg );
 
   TRACE("cb:%p arg:%p", cb, arg);
-
   if ( ctx ) {
     destroy_event_handle( &ctx->handle );
     return true;
   }
+
+  TRACE("XXX: Not found cb:%p arg:%p", cb, arg);
   return false;
 }
 
 static bool
 delete_timer_event_r( timer_callback cb, void *arg )
 {
+  TRACE( "%p:%p", cb, arg );
   return delete_timer_event_raw( get_ev_base( SAFE ), cb, arg );
 }
 
 static bool
 delete_timer_event_x( timer_callback cb, void *arg )
 {
+  TRACE( "%p:%p", cb, arg );
   return delete_timer_event_raw( Base, cb, arg );
 }
 
@@ -1305,6 +1292,7 @@ reg_signal_handler_raw( int signum, void (*cb)( int ) )
 static bool
 init_signal_handler_raw( void )
 {
+  TRACE( "" );
   return true;
 }
 
@@ -1312,6 +1300,7 @@ init_signal_handler_raw( void )
 static bool
 finalize_signal_handler_raw( void )
 {
+  TRACE( "" );
   return true;
 }
 

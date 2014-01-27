@@ -4,15 +4,19 @@
 #include <stdio.h>
 #include <event.h>
 #include <stdbool.h>
+#include <pthread.h>
+
 #include <curl/curl.h>
 
 #include <trema.h>
+
+#include "func_queue.h"
 
 # if 1
 #  include <stdlib.h>
 #  include <syslog.h>
 #  define _log(pri_,fmt_,...)     fprintf(stdout,fmt_,##__VA_ARGS__)
-#  define LOG(pri_,fmt_,...)      _log((pri_),"%s:%d:%s " fmt_ "\n", __FILE__,__LINE__,__func__, ##__VA_ARGS__)
+#  define LOG(pri_,fmt_,...)      _log((pri_),"%s:%d:%s() " fmt_ "\n", __FILE__,__LINE__,__func__, ##__VA_ARGS__)
 #  define TRACE(fmt_,...)         LOG(LOG_DEBUG,fmt_,##__VA_ARGS__)
 
 # endif
@@ -44,14 +48,21 @@ typedef struct {
 
 /* HTTP client thread info */
 typedef struct {
+  long response_timeout;		/* msec */
+  long connect_timeout;		/* msec */
+
   CURLM *multi;
   int running;
   bool timer;
+
+  func_q_t *func_q;
+  pthread_barrier_t barrier;
 } http_th_info_t;
 
 
 typedef void (*http_resp_handler)(int status, int code,
                                   const http_content_t *content, void *cb_arg);
+
 
 typedef struct {
   CURL *easy;
@@ -64,16 +75,20 @@ typedef struct {
   int status;
   int code;
   http_content_t *request;
-  http_content_t *response;
-  struct curl_slist *slist;
+  struct {
+    http_content_t *content;
+    int status;
+    int code;
 
-  http_resp_handler cb;
-  void *arg;
+    http_resp_handler cb;
+    void *arg;
+  } response;
+
+  struct curl_slist *slist;
 
   char *url;
   char error[CURL_ERROR_SIZE];
 } http_transaction_t;
-
 
 
 static inline void *
@@ -133,25 +148,12 @@ alloc_http_content(const char *type,
   return content;
 }
 
-
-
-
-
-extern void destroy_http_th(http_th_info_t *th_info);
-extern http_th_info_t *create_http_th(void);
-
-extern http_transaction_t *create_http_transaction(http_th_info_t *th_info,
-                                                   const char *url);
-
-
-extern void destroy_http_transaction(http_transaction_t *trans);
-
 extern bool do_http_request( int method,
                              const char *uri,
                              const http_content_t *content,
                              http_resp_handler cb,
                              void *cb_arg );
-extern bool init_http_client(void);
+extern bool init_http_client(long response_to, long connect_to);
 extern bool finalize_http_client(void);
 
 
