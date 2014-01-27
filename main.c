@@ -14,7 +14,7 @@
 #include <trema.h>
 #include "libevent_wrapper.h"
 
-#include "hiper.h"
+#include "http_client.h"
 
 
 /*****************************************************************************

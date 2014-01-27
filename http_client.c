@@ -13,7 +13,7 @@
 
 #include <trema.h>
 
-#include "hiper.h"
+#include "http_client.h"
 
 
 static void clean_completed_http_transaction(http_th_info_t *th_info);

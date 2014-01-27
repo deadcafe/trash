@@ -19,11 +19,10 @@ CFLAGS = \
          -Wconversion -Wfloat-equal -Wpointer-arith -pthread
 
 TARGET = http
-SRCS = main.c \
-       http_client.c queue.c \
-       func_queue.c
-
-SRCS = hiperfifo.c hiper.c queue.c func_queue.c
+SRCS =	main.c \
+	http_client.c \
+	queue.c \
+	func_queue.c
 
 #for libevent support
 CPPFLAGS += -DENABLE_LIBEVENT -I./compat
