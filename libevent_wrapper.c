@@ -15,10 +15,50 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <trema.h>
+
 #include "libevent_wrapper.h"
 
-#define USE_REDBLACK 1
-#define ENABLE_CAHCE 1
+#define CTX_TYPE_INVALID        0
+#define CTX_TYPE_TIMER          1
+#define CTX_TYPE_FD             2
+#define CTX_TYPE_SIGNAL         3
+
+typedef struct event_handle event_handle_t;
+typedef void ( *new_event_cb_t ) ( int fd, event_handle_t *handle,
+                                   void *arg );
+
+struct event_handle {
+  short type;
+  short flags;
+  int fd;                       /* or signal */
+
+  union {
+    struct {
+      void *read_cb;
+      void *read_data;
+
+      void *write_cb;
+      void *write_data;
+    } fd_val;
+
+    struct {
+      void *timer_cb;
+      void *timer_data;
+      struct timeval interval;
+    } timer_val;
+
+    struct {
+      void *signal_cb;
+      void *signal_data;
+    } signal_val;
+  } u;
+};
+
+
+
+#define USE_REDBLACK 0
+#define ENABLE_CAHCE 0
 
 #if 1
 # include <stdlib.h>
@@ -31,6 +71,9 @@
 # define TRACE(x,...)
 #endif
 
+#ifdef UNUSED
+# undef UNUSED
+#endif
 #define UNUSED __attribute__((unused))
 
 #define BASE_STATE_INVALID      0
@@ -115,13 +158,12 @@ struct _ctx_t {
 static pthread_key_t Key;       /* for thread safe */
 static ev_base_t *Base;         /*for none thread safe */
 
-static void *( *_malloc_fn ) ( size_t ) = NULL;
+static void *( *_malloc_fn ) ( size_t ) = xmalloc;
 static void *( *_realloc_fn ) ( void *, size_t ) = NULL;
-static void ( *_free_fn ) ( void * ) = NULL;
+static void ( *_free_fn ) ( void * ) = xfree;
 static suseconds_t tick = 0;
 
 #define MALLOC(s) _malloc_fn((s))
-#define REALLOC(p,s) _realloc_fn((p),(s))
 #define FREE(p)  _free_fn((p))
 
 static void clear_cache_ctx( ev_base_t *ev_base );
@@ -239,25 +281,20 @@ base_destructor( void *arg )
     destroy_ev_base( ev_base );
 }
 
-#define SAFE    true
-#define UNSAFE  false
 
 static inline ev_base_t *
-get_ev_base( bool safe )
+get_ev_base( void )
 {
-  ev_base_t *base = NULL;
+  ev_base_t *base;
 
-  if ( safe )
-    base = pthread_getspecific( Key );
-  else
-    base = Base;
+  base = pthread_getspecific( Key );
+  if (!base)
+    return base;
 
   if (base->thread != pthread_self()) {
     assert(base->thread == pthread_self());
     return NULL;
   }
-
-  assert( base );
   return base;
 }
 
@@ -320,7 +357,7 @@ create_ctx( ev_base_t *ev_base, short type )
     ctx->hd.refcnt = 1;
     ctx->handle.type = type;
     ctx->handle.fd = -1;
-    TRACE( "alloc ctx:%p", ctx );
+    //    TRACE( "alloc ctx:%p", ctx );
   }
   return ctx;
 }
@@ -338,7 +375,7 @@ detach_ctx( ctx_t *ctx )
   if ( !ctx->hd.refcnt ) {
     assert( ( ctx->hd.state & CTX_STATE_INVALID ) );
 
-    TRACE( "free ctx:%p", ctx );
+    //   TRACE( "free ctx:%p", ctx );
     if ( ctx->hd.ev ) {
       event_free( ctx->hd.ev );
       ctx->hd.ev = NULL;
@@ -388,7 +425,7 @@ find_ctx_fd( ev_base_t *ev_base, int fd )
 {
   ctx_t key;
 
-  TRACE( "base:%p fd:%d", ev_base, fd );
+  //  TRACE( "base:%p fd:%d", ev_base, fd );
   key.handle.type = CTX_TYPE_FD;
   key.handle.fd = fd;
   return CACHE_FIND( ev_base, &key );
@@ -399,7 +436,7 @@ find_ctx_tm( ev_base_t *ev_base, void *cb, void *arg )
 {
   ctx_t key;
 
-  TRACE( "base:%p cb:%p arg:%p", ev_base, cb, arg );
+  //  TRACE( "base:%p cb:%p arg:%p", ev_base, cb, arg );
   key.handle.type = CTX_TYPE_TIMER;
   key.handle.fd = -1;
   key.handle.u.timer_val.timer_cb = cb;
@@ -418,7 +455,7 @@ add_db_ctx( ctx_t *ctx )
   old = TREE_INSERT( ctx_db, &ev_base->head, ctx );
   assert( !old );
   attach_ctx( ctx );
-  TRACE( "fd:%d cnt:%d state:%x", ctx->handle.fd, ctx->hd.refcnt, ctx->hd.state );
+  //  TRACE( "fd:%d cnt:%d state:%x", ctx->handle.fd, ctx->hd.refcnt, ctx->hd.state );
 }
 
 static inline void
@@ -429,7 +466,7 @@ del_db_ctx( ctx_t *ctx )
   if ( ctx->hd.state & CTX_STATE_ADDED_DB ) {
     ctx->hd.state &= ~CTX_STATE_ADDED_DB;
     TREE_REMOVE( ctx_db, &ev_base->head, ctx );
-    TRACE( "fd:%d cnt:%d state:%x", ctx->handle.fd, ctx->hd.refcnt, ctx->hd.state );
+    //    TRACE( "fd:%d cnt:%d state:%x", ctx->handle.fd, ctx->hd.refcnt, ctx->hd.state );
     detach_ctx( ctx );
   }
 }
@@ -461,7 +498,7 @@ del_ev_ctx( ctx_t *ctx )
   if ( ctx->hd.state & CTX_STATE_ADDED_EV ) {
     ctx->hd.state &= ~CTX_STATE_ADDED_EV;
     event_del( ctx->hd.ev );
-    TRACE( "fd:%d cnt:%d state:%x", ctx->handle.fd, ctx->hd.refcnt, ctx->hd.state );
+    //    TRACE( "fd:%d cnt:%d state:%x", ctx->handle.fd, ctx->hd.refcnt, ctx->hd.state );
     detach_ctx( ctx );
   }
 }
@@ -475,7 +512,7 @@ add_ev_ctx( ctx_t *ctx, const struct timeval *tm )
     return false;
   ctx->hd.state |= CTX_STATE_ADDED_EV;
   attach_ctx( ctx );
-  TRACE( "fd:%d cnt:%d state:%x", ctx->handle.fd, ctx->hd.refcnt, ctx->hd.state );
+  //  TRACE( "fd:%d cnt:%d state:%x", ctx->handle.fd, ctx->hd.refcnt, ctx->hd.state );
   return true;
 }
 
@@ -487,7 +524,8 @@ handler_core( int fd, short flags, void *arg )
 {
   ctx_t *ctx = arg;
 
-  TRACE( "start fd:%d flags:%x state:%x --------->", fd, flags, ctx->hd.state );
+  TRACE( "%x:start fd:%d flags:%x state:%x --------->",
+         (unsigned)pthread_self(), fd, flags, ctx->hd.state );
   assert( ctx && ctx->handle.fd == fd );
 
   attach_ctx( ctx );
@@ -550,21 +588,27 @@ handler_core( int fd, short flags, void *arg )
 static void
 init_event_handler_r( void )
 {
-  ev_base_t *ev_base;
+  TRACE("%x:%d", (unsigned)pthread_self(), getpid());
 
-  TRACE( "" );
-
-  ev_base = create_ev_base( &Key, tick );
-  assert( ev_base );
+  if (get_ev_base()) {
+     TRACE("already init");
+  } else {
+    ev_base_t *ev_base = create_ev_base( &Key, tick );
+    assert( ev_base );
+  }
 }
 
 static void
 init_event_handler_x( void )
 {
-  TRACE( "" );
+  TRACE("%x:%d", (unsigned)pthread_self(), getpid());
 
-  init_event_handler_r();
-  Base = get_ev_base( SAFE );
+  if (Base) {
+    TRACE("already init");
+  } else {
+    Base = create_ev_base( &Key, tick );
+    assert( Base );
+  }
 }
 
 /***************************************************************************
@@ -573,15 +617,15 @@ init_event_handler_x( void )
 static void
 finalize_event_handler_r( void )
 {
-  TRACE( "" );
-  ev_base_t *ev_base = get_ev_base( SAFE );
+  TRACE("%x", (unsigned)pthread_self());
+  ev_base_t *ev_base = get_ev_base();
   destroy_ev_base( ev_base );
 }
 
 static void
 finalize_event_handler_x( void )
 {
-  TRACE( "" );
+  TRACE("%x", (unsigned)pthread_self());
   if ( Base ) {
     finalize_event_handler_r();
     Base = NULL;
@@ -626,7 +670,7 @@ run_event_handler_once_r( int timeout_usec )
 static bool
 run_event_handler_once_x( int timeout_usec )
 {
-  return run_event_handler_once_raw( get_ev_base( UNSAFE ), timeout_usec );
+  return run_event_handler_once_raw( get_ev_base(), timeout_usec );
 }
 
 /***************************************************************************
@@ -635,7 +679,6 @@ run_event_handler_once_x( int timeout_usec )
 static bool
 start_event_handler_raw( ev_base_t *ev_base )
 {
-  TRACE( "" );
   ev_base->state = BASE_STATE_RUNNING;
 
   while ( ev_base->state == BASE_STATE_RUNNING ) {
@@ -648,13 +691,15 @@ start_event_handler_raw( ev_base_t *ev_base )
 static bool
 start_event_handler_r( void )
 {
-  return start_event_handler_raw( get_ev_base( SAFE ) );
+  TRACE("%x", (unsigned)pthread_self());
+  return start_event_handler_raw( get_ev_base() );
 }
 
 static bool
 start_event_handler_x( void )
 {
-  return start_event_handler_raw( get_ev_base( UNSAFE ) );
+  TRACE("%x", (unsigned)pthread_self());
+  return start_event_handler_raw( get_ev_base() );
 }
 
 /***************************************************************************
@@ -663,7 +708,6 @@ start_event_handler_x( void )
 static void
 stop_event_handler_raw( ev_base_t *ev_base )
 {
-  TRACE( "" );
   ev_base->state = BASE_STATE_STOP;
   event_base_loopbreak(ev_base->base);
 }
@@ -671,13 +715,15 @@ stop_event_handler_raw( ev_base_t *ev_base )
 static void
 stop_event_handler_r( void )
 {
-  stop_event_handler_raw( get_ev_base( SAFE ) );
+  TRACE("%x", (unsigned)pthread_self());
+  stop_event_handler_raw( get_ev_base() );
 }
 
 static void
 stop_event_handler_x( void )
 {
-  stop_event_handler_raw( get_ev_base( UNSAFE ) );
+  TRACE("%x", (unsigned)pthread_self());
+  stop_event_handler_raw( get_ev_base() );
 }
 
 /***************************************************************************
@@ -688,7 +734,6 @@ create_event_handle_raw( ev_base_t *ev_base,
                          int fd,
                          void *r_cb, void *r_arg, void *w_cb, void *w_arg )
 {
-  TRACE( "base:%p fd:%d", ev_base, fd );
   ctx_t *ctx;
   assert( ev_base && fd >= 0 );
 
@@ -705,8 +750,8 @@ create_event_handle_raw( ev_base_t *ev_base,
   return NULL;
 }
 
-/* New API */
-event_handle_t *
+#if 0
+static event_handle_t *
 create_event_handle_r( int fd,
                        new_event_cb_t r_cb, void *r_arg,
                        new_event_cb_t w_cb, void *w_arg )
@@ -714,14 +759,17 @@ create_event_handle_r( int fd,
   return create_event_handle_raw( get_ev_base( SAFE ), fd, r_cb, r_arg, w_cb,
                                   w_arg );
 }
+#endif
 
-event_handle_t *
+#if 0
+static event_handle_t *
 create_event_handle( int fd,
                      new_event_cb_t r_cb, void *r_arg,
                      new_event_cb_t w_cb, void *w_arg )
 {
   return create_event_handle_raw( Base, fd, r_cb, r_arg, w_cb, w_arg );
 }
+#endif
 
 static bool
 set_fd_handler_raw( ev_base_t *ev_base,
@@ -742,7 +790,8 @@ set_fd_handler_r( int fd,
                   event_fd_callback read_cb, void *read_d,
                   event_fd_callback write_cb, void *write_d )
 {
-  set_fd_handler_raw( get_ev_base( SAFE ), fd, read_cb, read_d, write_cb,
+  TRACE("%x:%d", (unsigned)pthread_self(), fd);
+  set_fd_handler_raw( get_ev_base(), fd, read_cb, read_d, write_cb,
                       write_d );
 }
 
@@ -751,7 +800,8 @@ set_fd_handler_x( int fd,
                   event_fd_callback read_cb, void *read_d,
                   event_fd_callback write_cb, void *write_d )
 {
-  set_fd_handler_raw( get_ev_base( UNSAFE ), fd, read_cb, read_d, write_cb,
+  TRACE("%x:%d", (unsigned)pthread_self(), fd);
+  set_fd_handler_raw( get_ev_base(), fd, read_cb, read_d, write_cb,
                       write_d );
 }
 
@@ -777,8 +827,6 @@ destroy_event_handle( event_handle_t *handle )
 static bool
 delete_fd_handler_raw( ev_base_t *ev_base, int fd )
 {
-  TRACE( "base:%p fd:%d", ev_base, fd );
-
   if ( ev_base ) {
     ctx_t *ctx;
 
@@ -795,12 +843,14 @@ delete_fd_handler_raw( ev_base_t *ev_base, int fd )
 static void
 delete_fd_handler_r( int fd )
 {
-  delete_fd_handler_raw( get_ev_base( SAFE ), fd );
+  TRACE("%x:%d", (unsigned)pthread_self(), fd);
+  delete_fd_handler_raw( get_ev_base(), fd );
 }
 
 static void
 delete_fd_handler_x( int fd )
 {
+  TRACE("%x:%d", (unsigned)pthread_self(), fd);
   delete_fd_handler_raw( Base, fd );
 }
 
@@ -829,7 +879,6 @@ update_flags_ctx( ctx_t *ctx, short flags )
 static void
 set_flags_raw( ev_base_t *ev_base, int fd, short flags, bool set )
 {
-  TRACE( "base:%p fd:%d flags:%x set:%d", ev_base, fd, flags, set );
   if ( !ev_base )
     return;
   assert( flags != 0 );
@@ -846,14 +895,14 @@ set_flags_raw( ev_base_t *ev_base, int fd, short flags, bool set )
 static void
 set_readable_r( int fd, bool state )
 {
-  TRACE( "fd:%d state:%d", fd, state );
-  set_flags_raw( get_ev_base( SAFE ), fd, EV_READ, state );
+  TRACE( "%x:fd:%d state:%d", (unsigned)pthread_self(), fd, state );
+  set_flags_raw( get_ev_base(), fd, EV_READ, state );
 }
 
 static void
 set_readable_x( int fd, bool state )
 {
-  TRACE( "fd:%d set:%d", fd, state );
+  TRACE( "%x:fd:%d state:%d", (unsigned)pthread_self(), fd, state );
   set_flags_raw( Base, fd, EV_READ, state );
 }
 
@@ -863,14 +912,14 @@ set_readable_x( int fd, bool state )
 static void
 set_writable_r( int fd, bool state )
 {
-  TRACE( "fd:%d state:%d", fd, state );
-  set_flags_raw( get_ev_base( SAFE ), fd, EV_WRITE, state );
+  TRACE( "%x:fd:%d state:%d", (unsigned)pthread_self(), fd, state );
+  set_flags_raw( get_ev_base(), fd, EV_WRITE, state );
 }
 
 static void
 set_writable_x( int fd, bool state )
 {
-  TRACE( "fd:%d state:%d", fd, state );
+  TRACE( "%x:fd:%d state:%d", (unsigned)pthread_self(), fd, state );
   set_flags_raw( Base, fd, EV_WRITE, state );
 }
 
@@ -880,7 +929,6 @@ set_writable_x( int fd, bool state )
 static bool
 readable_raw( ev_base_t *ev_base, int fd )
 {
-  TRACE( "base:%p fd:%d", ev_base, fd );
   ctx_t *ctx = find_ctx_fd( ev_base, fd );
   if ( ctx )
     return ( ctx->hd.cur_flags & EV_READ );
@@ -890,12 +938,14 @@ readable_raw( ev_base_t *ev_base, int fd )
 static bool
 readable_r( int fd )
 {
-  return readable_raw( get_ev_base( SAFE ), fd );
+  TRACE("%x:%d", (unsigned)pthread_self(), fd);
+  return readable_raw( get_ev_base(), fd );
 }
 
 static bool
 readable_x( int fd )
 {
+  TRACE("%x:%d", (unsigned)pthread_self(), fd);
   return readable_raw( Base, fd );
 }
 
@@ -905,7 +955,6 @@ readable_x( int fd )
 static bool
 writable_raw( ev_base_t *ev_base, int fd )
 {
-  TRACE( "" );
   ctx_t *ctx = find_ctx_fd( ev_base, fd );
   if ( ctx )
     return ( ctx->hd.cur_flags & EV_WRITE );
@@ -915,12 +964,14 @@ writable_raw( ev_base_t *ev_base, int fd )
 static bool
 writable_r( int fd )
 {
-  return writable_raw( get_ev_base( SAFE ), fd );
+  TRACE("%x:%d", (unsigned)pthread_self(), fd);
+  return writable_raw( get_ev_base(), fd );
 }
 
 static bool
 writable_x( int fd )
 {
+  TRACE("%x:%d", (unsigned)pthread_self(), fd);
   return writable_raw( Base, fd );
 }
 
@@ -941,12 +992,14 @@ set_external_callback_raw( ev_base_t *ev_base, external_callback_t cb )
 static bool
 set_external_callback_r( external_callback_t cb )
 {
-  return set_external_callback_raw( get_ev_base( SAFE ), cb );
+  TRACE("%x", (unsigned)pthread_self());
+  return set_external_callback_raw( get_ev_base(), cb );
 }
 
 static bool
 set_external_callback_x( external_callback_t cb )
 {
+  TRACE("%x", (unsigned)pthread_self());
   return set_external_callback_raw( Base, cb );
 }
 
@@ -992,7 +1045,6 @@ reg_event_wrapper( void )
 static bool
 init_timer_raw( ev_base_t *ev_base )
 {
-  TRACE( "" );
   if ( !ev_base )
     return false;
   return true;
@@ -1001,12 +1053,14 @@ init_timer_raw( ev_base_t *ev_base )
 static bool
 init_timer_r( void )
 {
-  return init_timer_raw( get_ev_base( SAFE ) );
+  TRACE("%x", (unsigned)pthread_self());
+  return init_timer_raw( get_ev_base() );
 }
 
 static bool
 init_timer_x( void )
 {
+  TRACE("%x", (unsigned)pthread_self());
   return init_timer_raw( Base );
 }
 
@@ -1027,12 +1081,14 @@ finalize_timer_raw( ev_base_t *ev_base )
 static bool
 finalize_timer_r( void )
 {
-  return finalize_timer_raw( get_ev_base( SAFE ) );
+  TRACE("%x", (unsigned)pthread_self());
+  return finalize_timer_raw( get_ev_base() );
 }
 
 static bool
 finalize_timer_x( void )
 {
+  TRACE("%x", (unsigned)pthread_self());
   return finalize_timer_raw( Base );
 }
 
@@ -1040,22 +1096,25 @@ finalize_timer_x( void )
  *
  */
 static bool
-execute_timer_events_raw( ev_base_t *ev_base, int *next_timeout_usec UNUSED )
+execute_timer_events_raw( ev_base_t *ev_base, int *next_timeout_usec )
 {
   if ( !ev_base )
     return false;
+  *next_timeout_usec = 0;
   return true;
 }
 
 static void
 execute_timer_events_r( int *next_timeout_usec )
 {
-  execute_timer_events_raw( get_ev_base( SAFE ), next_timeout_usec );
+  TRACE("%x", (unsigned)pthread_self());
+  execute_timer_events_raw( get_ev_base(), next_timeout_usec );
 }
 
 static void
 execute_timer_events_x( int *next_timeout_usec )
 {
+  TRACE("%x", (unsigned)pthread_self());
   execute_timer_events_raw( Base, next_timeout_usec );
 }
 
@@ -1150,15 +1209,15 @@ static bool
 add_timer_event_callback_r( struct itimerspec *interval,
                             timer_callback cb, void *arg )
 {
-  TRACE( "%p:%p", cb, arg );
-  return add_timer_event_callback_raw( get_ev_base( SAFE ), interval, cb, arg );
+  TRACE( "%x:%p:%p", (unsigned)pthread_self(), cb, arg );
+  return add_timer_event_callback_raw( get_ev_base(), interval, cb, arg );
 }
 
 static bool
 add_timer_event_callback_x( struct itimerspec *interval,
                             timer_callback cb, void *arg )
 {
-  TRACE( "%p:%p", cb, arg );
+  TRACE( "%x:%p:%p", (unsigned)pthread_self(), cb, arg );
   return add_timer_event_callback_raw( Base, interval, cb, arg );
 }
 
@@ -1181,15 +1240,15 @@ static inline bool
 add_periodic_event_callback_r( const time_t sec,
                                timer_callback cb, void *arg )
 {
-  TRACE( "%p:%p", cb, arg );
-  return add_periodic_event_callback_raw( get_ev_base( SAFE ), sec, cb, arg );
+  TRACE( "%x:%p:%p", (unsigned)pthread_self(), cb, arg );
+  return add_periodic_event_callback_raw( get_ev_base(), sec, cb, arg );
 }
 
 static bool
 add_periodic_event_callback_x( const time_t sec,
                                timer_callback cb, void *arg )
 {
-  TRACE( "%p:%p", cb, arg );
+  TRACE( "%x:%p:%p", (unsigned)pthread_self(), cb, arg );
   return add_periodic_event_callback_raw( Base, sec, cb, arg );
 }
 
@@ -1215,14 +1274,14 @@ delete_timer_event_raw( ev_base_t *ev_base,
 static bool
 delete_timer_event_r( timer_callback cb, void *arg )
 {
-  TRACE( "%p:%p", cb, arg );
-  return delete_timer_event_raw( get_ev_base( SAFE ), cb, arg );
+  TRACE( "%x:%p:%p", (unsigned)pthread_self(), cb, arg );
+  return delete_timer_event_raw( get_ev_base(), cb, arg );
 }
 
 static bool
 delete_timer_event_x( timer_callback cb, void *arg )
 {
-  TRACE( "%p:%p", cb, arg );
+  TRACE( "%x:%p:%p", (unsigned)pthread_self(), cb, arg );
   return delete_timer_event_raw( Base, cb, arg );
 }
 
@@ -1232,7 +1291,7 @@ delete_timer_event_x( timer_callback cb, void *arg )
 static void
 reg_timer_wrapper( void )
 {
-  TRACE( "" );
+  TRACE("%x", (unsigned)pthread_self());
 
   init_timer = init_timer_x;
   finalize_timer = finalize_timer_x;
@@ -1267,9 +1326,7 @@ create_signal_handle_raw( ev_base_t *ev_base,
   ctx->handle.u.signal_val.signal_data = arg;
 
   add_db_ctx( ctx );
-
   evsignal_assign( ctx->hd.ev, ctx->hd.base->base, sig_no, handler_core, ctx );
-
   add_ev_ctx( ctx, NULL );
   return &ctx->handle;
 }
@@ -1278,6 +1335,7 @@ create_signal_handle_raw( ev_base_t *ev_base,
 static bool
 reg_signal_handler_raw( int signum, void (*cb)( int ) )
 {
+  TRACE("%x:%d:%p", (unsigned)pthread_self(), signum, cb);
   event_handle_t *handle;
 
   handle = create_signal_handle_raw( Base, signum, (new_event_cb_t) cb, NULL );
@@ -1293,7 +1351,7 @@ reg_signal_handler_raw( int signum, void (*cb)( int ) )
 static bool
 init_signal_handler_raw( void )
 {
-  TRACE( "" );
+  TRACE("%x", (unsigned)pthread_self());
   return true;
 }
 
@@ -1301,7 +1359,7 @@ init_signal_handler_raw( void )
 static bool
 finalize_signal_handler_raw( void )
 {
-  TRACE( "" );
+  TRACE("%x", (unsigned)pthread_self());
   return true;
 }
 
@@ -1309,7 +1367,7 @@ finalize_signal_handler_raw( void )
 static void
 reg_signal_wrapper( void )
 {
-  TRACE( "" );
+  TRACE("%x", (unsigned)pthread_self());
 
   reg_signal_handler = reg_signal_handler_raw;
   //  ignore_signal: not wrapping
@@ -1355,3 +1413,12 @@ finalize_libevent_wrapper( void )
     return false;
   return true;
 }
+
+#ifdef LIBEVENT_WRAPPER_AUTO_INIT
+
+__attribute__ ((constructor)) void constructor(void) {
+  fprintf(stdout, "xxxxxxx\n");
+  init_libevent_wrapper(NULL, NULL, NULL, 0);
+}
+
+#endif /* LIBEVENT_WRAPPER_AUTO_INIT */

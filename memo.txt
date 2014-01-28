@@ -1,0 +1,65 @@
+trema 及び vnm における制御できるFD数制限についての考察
+
+1. 詳細
+
+Trema は selecet system callによりファイルディスクリプタ制御を実装している為、
+FD_SETSIZE を越えたファイルディスクリプタを許容できない。また、Linux はFD_SETSIZEの
+変更は基本的には不可の為、Trema APにはスケーラビリティに問題がある。
+
+
+2. 変更方針
+
+  (1) Trema のファイルディスクリプタ制御を実装を libevent で置き換える。
+  (2) 既存 Trema API を保持する。
+
+
+3. libevent を使用する際の問題点
+
+  (1) Trema では timer API と event API が分離している。
+     → libevent で統合する。
+  (2) Trema でが thread safe API が event, timer それぞれに存在する。
+     → 両方共に libevent で実装する。
+  (3) Trema には signal handler API がない。
+     → Trema に signal handler API を追加する（現状の実装をAPI化するのみ）。
+     → 上記APIを改めて libevent で実装する。
+  (4) VNM では http client thread において select() を使用している。
+     → select() 等を直接使用せずに Trema API で上記部分を実装する。
+
+
+4. 実装方法
+
+libtrema は ABI の wrapping が可能でる為、下記のABIを libevent_wrapper に新規実装する。
+
+         event_handler.h    safe_event_handler.h
+         timer.h            safe?timer.h
+         signal_handler.h(新規追加)
+
+timer event、signal event は汎用 event に依存した実装とする。
+その為、initialize、finalize の順番の変更が必要となる。
+
+
+5. 制限事項
+
+trema thread safe API
+
+
+変更順序：
+(1) trema API に signal handler API を追加する。
+(2) libtrema の signal handler を上記　API で記述する。
+(3) libtrema 内の initialize 処理にて event モジュールを timer モジュールより先に行う。
+(4) libtrema 内の finalize 処理にて event モジュールを timer モジュールより後に行う。
+
+ここまでは順序等は変更されたが、Trema は既存実装のままである。
+
+(5) VNM の http_client.c を trema API を使用した実装に書き換える。
+(6) VNM の signal handler 実装を新規 API で実装する。
+
+ここまではTrema API を使用しての実装しているが、ABI内部は既存実装のままである。
+
+(7) VNM に linevent_wrapper をリンクする。
+
+
+5. 規模
+
+trema wrapper:   1.5KL
+VNM http client: 1.5KL

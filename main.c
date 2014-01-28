@@ -52,14 +52,14 @@ dump(const char *fmt, ...)
 static void
 resp(int status,
      int code,
-     const http_content_t *content,
+     const http_content *content,
      void *arg __attribute__((unused)))
 {
   TRACE("status:%d code:%d", status, code);
 
   if (content) {
-    if (content->type)
-    TRACE("type: %s", content->type);
+    if (content->content_type)
+    TRACE("type: %s", content->content_type);
 
     if (content->body) {
       dump_buffer(content->body, dump);
@@ -186,17 +186,24 @@ main(int ac, char **av)
     }
   }
 
+#if 0
   init_libevent_wrapper( xmalloc, NULL, xfree, 0 );
+#endif
 
-  init_event_handler_safe();
-  init_timer_safe();
-  init_signal_handler();
+  init_trema(&ac, &av);
+  TRACE("Done trema init");
+
+
 
   init_http_client(10L, 5L);
 
   fifo = create_fifo_info();
 
-  start_event_handler_safe();
+  TRACE("starting trema");
+  start_trema();
+  TRACE("stoping trema");
+
+
   TRACE("stopping main thread");
   destroy_fifo_info(fifo);
 
@@ -206,7 +213,9 @@ main(int ac, char **av)
   finalize_timer_safe();
   finalize_event_handler_safe();
 
+#if 0
   finalize_libevent_wrapper();
+#endif
 
   fprintf(stderr, "END\n");
   return 0;

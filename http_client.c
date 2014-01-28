@@ -10,10 +10,59 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <pthread.h>
+#include <curl/curl.h>
 
-#include <trema.h>
-
+#include "func_queue.h"
 #include "http_client.h"
+
+# if 0
+#  include <stdlib.h>
+#  include <syslog.h>
+#  define _log(pri_,fmt_,...)     fprintf(stdout,fmt_,##__VA_ARGS__)
+#  define LOG(pri_,fmt_,...)      _log((pri_),"%s:%d:%s() " fmt_ "\n", __FILE__,__LINE__,__func__, ##__VA_ARGS__)
+#  define TRACE(fmt_,...)         LOG(LOG_DEBUG,fmt_,##__VA_ARGS__)
+
+# endif
+
+
+/* HTTP client thread info */
+typedef struct {
+  long response_timeout;		/* msec */
+  long connect_timeout;			/* msec */
+
+  CURLM *multi;
+  int running;
+  bool timer;
+
+  func_q_t *func_q;
+  pthread_barrier_t barrier;
+} http_th_info_t;
+
+typedef struct _http_transaction_t {
+  CURL *easy;
+  http_th_info_t *th_info;
+
+  curl_socket_t sock;
+  int action;
+
+  int method;
+  http_content *request;
+  struct {
+    http_content *content;
+    int status;
+    int code;
+
+    http_resp_handler cb;
+    void *arg;
+  } response;
+
+  struct curl_slist *slist;
+
+  char *url;
+  char error[CURL_ERROR_SIZE];
+} http_transaction_t;
+
 
 #define	FREE(_p)	xfree((_p))
 #define	MALLOC(_s)	xmalloc((_s))
@@ -29,67 +78,6 @@
 
 static void clean_completed_http_transaction(http_th_info_t *th_info);
 static void reply_handler(void *arg);
-
-
-static inline void *
-STRDUP(const char *s)
-{
-  size_t len = strlen(s) + 1;
-  char *p = MALLOC(len);
-
-  if (p)
-    memcpy(p, s, len);
-  return p;
-}
-
-
-static inline void
-free_http_content(http_content_t *content)
-{
-  if (content) {
-    if (content->type) {
-      FREE(content->type);
-      content->type = NULL;
-    }
-
-    if (content->body) {
-      free_buffer(content->body);
-      content->body = NULL;
-    }
-    FREE(content);
-  }
-}
-
-
-static inline http_content_t *
-alloc_http_content(const char *type,
-                   const buffer *body)
-{
-  http_content_t *content = MALLOC(sizeof(*content));
-
-  if (content) {
-    content->body = NULL;
-    content->type = NULL;
-
-    if (type) {
-      if ((content->type = STRDUP(type)) == NULL) {
-        free_http_content(content);
-        content = NULL;
-        goto end;
-      }
-    }
-    if (body) {
-      if ((content->body = duplicate_buffer(body)) == NULL) {
-        free_http_content(content);
-        content = NULL;
-        goto end;
-      }
-    }
-  }
- end:
-  return content;
-}
-
 
 #define EASY_SETOPT(_e, _o, _p) {                       \
     CURLcode _rc = curl_easy_setopt((_e), (_o), (_p));  \
@@ -286,8 +274,11 @@ clean_completed_http_transaction(http_th_info_t *th_info)
           trans->response.status = HTTP_TRANSACTION_SUCCEEDED;
 
         if (curl_easy_getinfo(easy, CURLINFO_CONTENT_TYPE, &type) ==  CURLE_OK) {
-          if (type)
-            trans->response.content->type = STRDUP(type);
+          if (type) {
+            trans->response.content->content_type = MALLOC(strlen(type) + 1);
+            if (trans->response.content->content_type)
+              memcpy(trans->response.content->content_type, type, strlen(type) + 1);
+          }
         }
       }
 
@@ -413,7 +404,7 @@ read_from_buffer( void *ptr,
                   size_t nmemb,
                   void *arg )
 {
-  http_content_t *content = arg;
+  http_content *content = arg;
   buffer *buf = content->body;
   size_t real_size = size * nmemb;
   size_t len = 0;
@@ -444,7 +435,7 @@ write_to_buffer( void *contents,
                  size_t nmemb,
                  void *arg )
 {
-  http_content_t *content = arg;
+  http_content *content = arg;
   buffer *buf = NULL;
 
   TRACE( "Writing contents ( contents:%p size:%zu nmemb:%zu arg:%p ).",
@@ -557,8 +548,8 @@ destroy_http_th(http_th_info_t *th_info)
 
 
 static http_th_info_t *
-create_http_th(long response_to,
-               long connect_to)
+create_http_th(time_t response_to,
+               time_t connect_to)
 {
   http_th_info_t *th_info;
 
@@ -581,8 +572,8 @@ create_http_th(long response_to,
     MULTI_SETOPT(th_info->multi, CURLMOPT_TIMERFUNCTION, multi_timer_update);
     MULTI_SETOPT(th_info->multi, CURLMOPT_TIMERDATA, th_info);
 
-    th_info->response_timeout = response_to;
-    th_info->connect_timeout = connect_to;
+    th_info->response_timeout = (long) response_to * 1000L;
+    th_info->connect_timeout = (long) connect_to * 1000L;
 
     if (0) {
     error:
@@ -597,10 +588,10 @@ static http_th_info_t *HTTP_THREAD_INFO;
 static pthread_t http_client_thread;
 
 bool
-init_http_client(long response_to,
-                 long connect_to)
+init_http_client(time_t response_to,
+                 time_t connect_to)
 {
-  if (HTTP_THREAD_INFO || response_to <= 0 || connect_to <= 0)
+  if (HTTP_THREAD_INFO || !response_to || !connect_to )
     return false;
   if ((HTTP_THREAD_INFO = create_http_th(response_to, connect_to)) != NULL) {
     pthread_attr_t attr;
@@ -664,8 +655,8 @@ stop_http_client(void)
 
 bool
 do_http_request( int method,
-                 const char *uri,
-                 const http_content_t *content,
+                 const char *url,
+                 const http_content *content,
                  http_resp_handler cb,
                  void *cb_arg )
 {
@@ -679,18 +670,12 @@ do_http_request( int method,
     trans->error[0] = '\0';
     trans->th_info = HTTP_THREAD_INFO;
     trans->sock = -1;
-    if ((trans->url = STRDUP(uri)) == NULL)
+    if ((trans->url = MALLOC(strlen(url) + 1)) == NULL)
       goto error;
+    memcpy(trans->url, url, strlen(url) + 1);
 
-    if (content) {
-      trans->request = alloc_http_content(content->type, content->body);
-    } else {
-      trans->request = alloc_http_content(NULL, NULL);
-    }
-    if (!trans->request)
-      goto error;
 
-    trans->response.content = alloc_http_content(NULL, NULL);
+    trans->response.content = create_http_content(NULL, NULL, 0);
     if (!trans->response.content)
       goto error;
 
@@ -743,12 +728,18 @@ do_http_request( int method,
       goto error;
     }
 
-    if ( trans->request->body && trans->request->body->length ) {
+    if (content) {
+      trans->request = create_http_content(content->content_type,
+                                           content->body->data,
+                                           content->body->length);
+      if (!trans->request)
+        goto error;
+
       char buff[ 128 ];
       const char *p;
 
-      if ( trans->request->type && strlen( trans->request->type ) )
-        p = trans->request->type;
+      if ( trans->request->content_type )
+        p = trans->request->content_type;
       else
         p = "text/plain";
 
@@ -781,7 +772,7 @@ do_http_request( int method,
       trans = NULL;
     }
   }
-  TRACE("trans:%p %s", trans, uri);
+  TRACE("trans:%p %s", trans, url);
   if (trans)
     return true;
   return false;
@@ -798,4 +789,61 @@ reply_handler(void *arg) {
                        trans->response.content, trans->response.arg);
     destroy_http_transaction(trans);
   }
+}
+
+
+void
+free_http_content(http_content *content)
+{
+  if (content) {
+    if (content->content_type) {
+      FREE(content->content_type);
+      content->content_type = NULL;
+    }
+    if (content->body) {
+      free_buffer(content->body);
+      content->body = NULL;
+    }
+    FREE(content);
+  }
+}
+
+
+http_content *
+create_http_content(const char *content_type,
+                    const void *body_p,
+                    size_t body_length)
+{
+  http_content *content = MALLOC(sizeof(*content));
+
+  if (content) {
+    size_t len;
+
+    content->content_type = NULL;
+    content->body = NULL;
+
+    if (content_type) {
+      len = strlen(content_type) + 1;
+      if ((content->content_type = MALLOC(len)) == NULL)
+        goto error;
+      memcpy(content->content_type, content_type, len);
+    }
+
+    if ((content->body = alloc_buffer()) == NULL)
+      goto error;
+
+    if (body_length) {
+      char *p = append_back_buffer(content->body, body_length);
+      if (!p)
+        goto error;
+      memcpy(p, body_p, body_length);
+    }
+
+    if (0) {
+    error:
+      free_http_content(content);
+      content = NULL;
+    }
+  }
+  return content;
 }
