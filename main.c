@@ -16,15 +16,8 @@
 
 #include "http_client.h"
 
-
-# if 1
-#  include <stdlib.h>
-#  include <syslog.h>
-#  define _log(pri_,fmt_,...)     fprintf(stdout,fmt_,##__VA_ARGS__)
-#  define LOG(pri_,fmt_,...)      _log((pri_),"%s:%d:%s() " fmt_ "\n", __FILE__,__LINE__,__func__, ##__VA_ARGS__)
-#  define TRACE(fmt_,...)         LOG(LOG_DEBUG,fmt_,##__VA_ARGS__)
-# endif
-
+#define ENABLE_TRACE
+#include "private_log.h"
 
 #define	FREE(_p)	xfree((_p))
 #define	MALLOC(_s)	xmalloc((_s))
@@ -77,7 +70,8 @@ destroy_fifo_info(fifo_info_t *fifo)
   if (fifo) {
     TRACE("");
     if (fifo->input) {
-      delete_fd_handler_safe(fifo->sock);
+      if (fifo->sock >= 0)
+        delete_fd_handler(fifo->sock);
       fclose(fifo->input);
     }
     FREE(fifo);
@@ -86,15 +80,26 @@ destroy_fifo_info(fifo_info_t *fifo)
 }
 
 
+static void
+http_client_end(void *arg)
+{
+  TRACE("arg:%p", arg);
+
+  finalize_http_client();
+  stop_event_handler();
+}
+
 /* This gets called whenever data is received from the fifo */
 static void
-fifo_cb(int sock __attribute__((unused)),
+fifo_cb(int sock,
         void *arg)
 {
   char s[1024];
   long int rv = 0;
   int n = 0;
   fifo_info_t *fifo = arg;
+
+  TRACE("sock:%d", sock);
 
   do {
     s[0] = '\0';
@@ -106,8 +111,8 @@ fifo_cb(int sock __attribute__((unused)),
         do_http_request( HTTP_METHOD_GET, s, NULL, resp, NULL);
       } else {
         stop_http_client();
-        stop_event_handler_safe();
-        delete_fd_handler_safe(sock);
+        delete_fd_handler(sock);
+        fifo->sock = -1;
         return;
       }
     } else
@@ -151,9 +156,9 @@ create_fifo_info(void)
     fifo->input = fdopen(sock, "r");
     fifo->sock = sock;
 
-    set_fd_handler_safe(sock, fifo_cb, fifo, NULL, NULL);
-    set_readable_safe(sock, true);
-    set_writable_safe(sock, false);
+    set_fd_handler(sock, fifo_cb, fifo, NULL, NULL);
+    set_readable(sock, true);
+    set_writable(sock, false);
 
     TRACE("Now, pipe some URL's into > %s", FIFO);
 
@@ -193,9 +198,9 @@ main(int ac, char **av)
   init_trema(&ac, &av);
   TRACE("Done trema init");
 
+  set_logging_level("debug");
 
-
-  init_http_client(10L, 5L);
+  init_http_client(http_client_end, NULL, 10L, 5L);
 
   fifo = create_fifo_info();
 
@@ -207,11 +212,6 @@ main(int ac, char **av)
   TRACE("stopping main thread");
   destroy_fifo_info(fifo);
 
-  finalize_http_client();
-
-  finalize_signal_handler();
-  finalize_timer_safe();
-  finalize_event_handler_safe();
 
 #if 0
   finalize_libevent_wrapper();

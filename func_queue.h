@@ -24,26 +24,32 @@ typedef enum {
   DIR_NUM,
 } func_q_dir_t;
 
+/* event handler type */
+typedef enum {
+  EH_TYPE_GENERIC = 0,
+  EH_TYPE_SAFE = 1,
+} func_q_ehtype_t;
+
+
 typedef struct _func_q_info_t {
   int fd;
-  int padding;
+  func_q_ehtype_t eh_type;
   eventfd_t val;
-  queue *queue;
   struct _func_q_info_t *another;
-  volatile size_t *state_p;
+  queue *queue;
+  pthread_t bind_th;
 } func_q_info_t;
 
 
 typedef struct {
   func_q_info_t info[DIR_NUM];
-  volatile size_t state;
 } func_q_t;
 
 
 extern func_q_t *func_q_create( void );
 extern void func_q_destroy(func_q_t *func_q);
 
-extern bool func_q_bind(func_q_t *func_q, func_q_dir_t dir);
+extern bool func_q_bind(func_q_t *func_q, func_q_dir_t dir, func_q_ehtype_t eh_type);
 extern void func_q_unbind(func_q_t *func_q, func_q_dir_t dir);
 
 extern bool func_q_request(func_q_t *func_q,

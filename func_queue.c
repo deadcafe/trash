@@ -17,15 +17,8 @@
 #include "memory_barrier.h"
 #include "func_queue.h"
 
-
-# if 1
-#  include <stdlib.h>
-#  include <syslog.h>
-#  define _log(pri_,fmt_,...)     fprintf(stdout,fmt_,##__VA_ARGS__)
-#  define LOG(pri_,fmt_,...)      _log((pri_),"%s:%d:%s() " fmt_ "\n", __FILE__,__LINE__,__func__, ##__VA_ARGS__)
-#  define TRACE(fmt_,...)         LOG(LOG_DEBUG,fmt_,##__VA_ARGS__)
-# endif
-
+#define ENABLE_TRACE
+#include "private_log.h"
 
 #define	WMB()	write_memory_barrier()
 #define	RMB()	read_memory_barrier()
@@ -44,6 +37,14 @@ typedef struct {
   void (*cb)(void *);
 } func_q_msg_t;
 
+
+bool is_enable_libevent_wrapper(void) __attribute__((weak));
+
+bool
+is_enable_libevent_wrapper(void)
+{
+  return false;
+}
 
 static inline void
 CLOSE(int fd)
@@ -67,6 +68,8 @@ wakeup(func_q_info_t *info)
     int err = 0;
 
     while (!err && info->val) {
+      TRACE("knocking another thread. iam:%x", (unsigned)pthread_self());
+
       if (eventfd_write(info->fd, info->val) < 0) {
         err = errno;
         if (err == EINTR) {
@@ -74,13 +77,28 @@ wakeup(func_q_info_t *info)
         } else if (err == EAGAIN) {
           break;
         } else {
-          /* major error */
-          set_writable_safe(info->fd, false);
+          char buf[128];
+          strerror_r(err, buf, sizeof(buf));
+          ERROR("failed eventfd_write() %s", buf);
+
+          if (info->another->queue) {
+            if (info->another->eh_type == EH_TYPE_GENERIC) {
+              set_writable(info->fd, false);
+            } else {
+              set_writable_safe(info->fd, false);
+            }
+          }
           return false;
         }
       } else {
         info->val = 0;
-        set_writable_safe(info->fd, false);
+        if (info->another->queue) {
+          if (info->another->eh_type == EH_TYPE_GENERIC) {
+            set_writable(info->fd, false);
+          } else {
+            set_writable_safe(info->fd, false);
+          }
+        }
       }
     }
   }
@@ -94,7 +112,9 @@ read_cb(int fd,
 {
   func_q_info_t *info = arg;
   func_q_msg_t *msg;
+  TRACE("fd:%d info:%p", fd, info);
   assert(fd == info->fd);
+  assert(info->bind_th == pthread_self());
 
   while (1) {
     eventfd_t val;
@@ -105,11 +125,9 @@ read_cb(int fd,
     }
   }
 
-  if (info->queue) {
-    while ((msg = dequeue(info->queue)) != NULL) {
-      msg->cb(msg->arg);
-      FREE(msg);
-    }
+  while (info->queue && (msg = dequeue(info->queue)) != NULL) {
+    msg->cb(msg->arg);
+    FREE(msg);
   }
 }
 
@@ -120,17 +138,15 @@ write_cb(int fd,
 {
   func_q_info_t *info = arg;
   assert(fd == info->fd);
-
   wakeup(info);
 }
 
 
 static void
-null_cb(int fd __attribute__((unused)),
-        void *arg __attribute__((unused)))
+null_cb(int fd,
+        void *arg)
 {
-  /* nothing to do */
-  ;
+  ERROR("catch null event fd:%d arg:%p", fd, arg);
 }
 
 
@@ -140,18 +156,13 @@ func_q_request( func_q_t *func_q,
                 void (*cb)( void * ),
                 void *arg )
 {
+  DEBUG("Q:%p dir:%d cb:%p arg:%p", func_q, dir, cb, arg);
   assert(cb);
   assert(dir == DIR_TO_UP || dir == DIR_TO_DOWN);
   func_q_msg_t *msg;
-
   func_q_info_t *info = &func_q->info[dir];
-  size_t state = *info->state_p;
-  RMB();
 
-  if (state != STATE_READY)
-    return false;
-
-  if ((msg = MALLOC(sizeof(*msg))) != NULL) {
+  if (info->queue && (msg = MALLOC(sizeof(*msg))) != NULL) {
     msg->cb = cb;
     msg->arg = arg;
 
@@ -166,35 +177,45 @@ func_q_request( func_q_t *func_q,
 
 bool
 func_q_bind( func_q_t *func_q,
-             func_q_dir_t dir )
+             func_q_dir_t dir,
+             func_q_ehtype_t eh_type)
 {
   assert(dir == DIR_TO_UP || dir == DIR_TO_DOWN);
+  assert(eh_type == EH_TYPE_GENERIC || eh_type == EH_TYPE_SAFE);
   func_q_info_t *info = &func_q->info[dir];
+  info->eh_type = eh_type;
 
+  DEBUG("q:%p dir:%d type:%d", func_q, dir, eh_type);
   assert(info->queue == NULL);
   assert(info->fd >= 0);
   assert(info->another && info->another->fd >= 0);
+  assert(info->bind_th == 0);
 
   queue *queue = create_queue();
   if (queue) {
-    set_fd_handler_safe(info->fd, read_cb, info, null_cb, NULL);
-    set_readable_safe(info->fd, true);
-    set_writable_safe(info->fd, false);
 
-    set_fd_handler_safe(info->another->fd, null_cb, NULL,
-                        write_cb, info->another);
-    set_readable_safe(info->another->fd, false);
-    set_writable_safe(info->another->fd, false);
+    if (info->eh_type == EH_TYPE_GENERIC) {
+      set_fd_handler(info->fd, read_cb, info, null_cb, NULL);
+      set_readable(info->fd, true);
+      set_writable(info->fd, false);
 
+      set_fd_handler(info->another->fd, null_cb, NULL,
+                     write_cb, info->another);
+      set_readable(info->another->fd, false);
+      set_writable(info->another->fd, false);
+    } else {
+      set_fd_handler_safe(info->fd, read_cb, info, null_cb, NULL);
+      set_readable_safe(info->fd, true);
+      set_writable_safe(info->fd, false);
+
+      set_fd_handler_safe(info->another->fd, null_cb, NULL,
+                          write_cb, info->another);
+      set_readable_safe(info->another->fd, false);
+      set_writable_safe(info->another->fd, false);
+    }
+    info->bind_th = pthread_self();
     info->queue = queue;
     WMB();
-
-    queue = info->another->queue;
-    RMB();
-    if (queue) {
-      *info->state_p = STATE_READY;
-      WMB();
-    }
     return true;
   }
   return false;
@@ -207,31 +228,37 @@ func_q_unbind(func_q_t *func_q,
 {
   assert(dir == DIR_TO_UP || dir == DIR_TO_DOWN);
 
-  TRACE("dir:%d", dir);
-
   func_q_info_t *info = (&func_q->info[dir]);
   int fd = info->fd;
   int another_fd = info->another->fd;
-  queue *queue = info->another->queue;
-  func_q_msg_t *msg;
+  queue *queue = info->queue;
 
   RMB();
-  *info->state_p = STATE_INVALID;
-  info->another->queue = NULL;
+  info->queue = NULL;
   info->val = 0;
   WMB();
 
-  delete_fd_handler_safe(fd);
-  delete_fd_handler_safe(another_fd);
+  assert(info->bind_th == pthread_self());
+  info->bind_th = 0;
+
+  if (info->eh_type == EH_TYPE_GENERIC) {
+    delete_fd_handler(fd);
+    delete_fd_handler(another_fd);
+  } else {
+    delete_fd_handler_safe(fd);
+    delete_fd_handler_safe(another_fd);
+  }
 
   if (queue) {
+    func_q_msg_t *msg;
+
     while ((msg = dequeue(queue)) != NULL) {
       msg->cb(msg->arg);
       FREE(msg);
     }
     delete_queue(queue);
-    TRACE("deleted q:%p", queue);
   }
+  DEBUG("q:%p dir:%d", func_q, dir);
 }
 
 
@@ -242,9 +269,7 @@ void
 func_q_destroy( func_q_t *func_q )
 {
   int i;
-  assert(func_q->state == STATE_INVALID);
-
-  TRACE("q:%p", func_q);
+  DEBUG("Q:%p", func_q);
 
   for (i = 0; i < DIR_NUM; i++) {
     assert(func_q->info[i].queue == NULL);
@@ -267,24 +292,25 @@ func_q_create( void )
     memset(func_q, 0, sizeof(*func_q));
     func_q->info[DIR_TO_UP].fd = -1;
     func_q->info[DIR_TO_DOWN].fd = -1;
-    func_q->info[DIR_TO_UP].state_p = &func_q->state;
-    func_q->info[DIR_TO_DOWN].state_p = &func_q->state;
     func_q->info[DIR_TO_UP].another = &func_q->info[DIR_TO_DOWN];
     func_q->info[DIR_TO_DOWN].another = &func_q->info[DIR_TO_UP];
 
     if ((fd = eventfd(0, EFD_NONBLOCK)) < 0) {
       func_q_destroy(func_q);
-      return NULL;
+      func_q = NULL;
+      goto end;
     }
     func_q->info[DIR_TO_UP].fd = fd;
 
     if ((fd = eventfd(0, EFD_NONBLOCK)) < 0) {
       func_q_destroy(func_q);
-      return NULL;
+      func_q = NULL;
+      goto end;
     }
     func_q->info[DIR_TO_DOWN].fd = fd;
-    TRACE("q:%p", func_q);
   }
+ end:
+  TRACE("Q:%p", func_q);
   return func_q;
 }
 

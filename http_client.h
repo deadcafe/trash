@@ -20,8 +20,8 @@ enum {
 };
 
 enum {
-  HTTP_TRANSACTION_FAILED = 0,
-  HTTP_TRANSACTION_SUCCEEDED = 1,
+  HTTP_TRANSACTION_SUCCEEDED = 0,
+  HTTP_TRANSACTION_FAILED = -1,
 };
 
 typedef struct {
@@ -39,7 +39,7 @@ extern bool do_http_request( int method,
                              http_resp_handler cb,
                              void *cb_arg );
 
-extern bool init_http_client(time_t response_to, time_t connect_to);
+extern bool init_http_client(void (*exit_cb)(void *), void *arg, time_t response_to, time_t connect_to);
 extern bool finalize_http_client(void);
 extern bool stop_http_client(void);
 

@@ -25,9 +25,11 @@ SRCS =	main.c \
 	func_queue.c
 
 #for libevent support
-CPPFLAGS += -DENABLE_LIBEVENT -DLIBEVENT_WRAPPER_AUTO_INIT -I./compat
+CPPFLAGS += -DENABLE_LIBEVENT -I./compat
 LDFLAGS += -pthread -levent
 SRCS += libevent_wrapper.c
+
+#CPPFLAGS += -DLIBEVENT_WRAPPER_AUTO_INIT
 
 
 OBJS = $(SRCS:.c=.o)
