@@ -20,13 +20,13 @@
 #  define TRACE(fmt_,...)
 # endif
 #else
-# define _CRITICAL(fmt_,...)	critical("%s:%d:%s() " fmt_,__FILE__,__LINE__,__func__, ##__VA_ARGS__)
-# define _ERROR(fmt_,...)	error("%s:%d:%s() " fmt_,__FILE__,__LINE__,__func__, ##__VA_ARGS__)
-# define _WARN(fmt_,...)	warn("%s:%d:%s() " fmt_,__FILE__,__LINE__,__func__, ##__VA_ARGS__)
-# define _NOTICE(fmt_,...)	notice("%s:%d:%s() " fmt_,__FILE__,__LINE__,__func__, ##__VA_ARGS__)
-# define _INFO(fmt_,...)	info("%s:%d:%s() " fmt_,__FILE__,__LINE__,__func__, ##__VA_ARGS__)
-# define _DEBUG(fmt_,...)	debug("%s:%d:%s() " fmt_,__FILE__,__LINE__,__func__, ##__VA_ARGS__)
-# define _TRACE(fmt_,...) 	debug("%s:%d:%s() " fmt_,__FILE__,__LINE__,__func__, ##__VA_ARGS__)
+# define _CRITICAL(fmt_,...)	critical("%x:%s:%d:%s() " fmt_,(unsigned)pthread_self(),__FILE__,__LINE__,__func__, ##__VA_ARGS__)
+# define _ERROR(fmt_,...)	error("%x:%s:%d:%s() " fmt_,(unsigned)pthread_self(),__FILE__,__LINE__,__func__, ##__VA_ARGS__)
+# define _WARN(fmt_,...)	warn("%x:%s:%d:%s() " fmt_,(unsigned)pthread_self(),__FILE__,__LINE__,__func__, ##__VA_ARGS__)
+# define _NOTICE(fmt_,...)	notice("%x:%s:%d:%s() " fmt_,(unsigned)pthread_self(),__FILE__,__LINE__,__func__, ##__VA_ARGS__)
+# define _INFO(fmt_,...)	info("%x:%s:%d:%s() " fmt_,(unsigned)pthread_self(),__FILE__,__LINE__,__func__, ##__VA_ARGS__)
+# define _DEBUG(fmt_,...)	debug("%x:%s:%d:%s() " fmt_,(unsigned)pthread_self(),__FILE__,__LINE__,__func__, ##__VA_ARGS__)
+# define _TRACE(fmt_,...) 	debug("%x:%s:%d:%s() " fmt_,(unsigned)pthread_self(),__FILE__,__LINE__,__func__, ##__VA_ARGS__)
 
 # define CRITICAL(fmt_,...)	_CRITICAL(fmt_,##__VA_ARGS__)
 # define ERROR(fmt_,...)	_ERROR(fmt_,##__VA_ARGS__)

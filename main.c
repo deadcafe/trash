@@ -32,7 +32,7 @@ typedef struct {
 } fifo_info_t;
 
 
-static void
+static inline void
 dump(const char *fmt, ...)
 {
   va_list ap;
@@ -51,11 +51,11 @@ resp(int status,
   TRACE("status:%d code:%d", status, code);
 
   if (content) {
-    if (content->content_type)
     TRACE("type: %s", content->content_type);
 
-    if (content->body) {
-      dump_buffer(content->body, dump);
+    if (content->body->data) {
+      //      dump_buffer(content->body, dump);
+      TRACE("resp content length:%zu", content->body->length);
       //      fputs(content->body->data, stderr);
     }
   }
@@ -158,7 +158,6 @@ create_fifo_info(void)
 
     set_fd_handler(sock, fifo_cb, fifo, NULL, NULL);
     set_readable(sock, true);
-    set_writable(sock, false);
 
     TRACE("Now, pipe some URL's into > %s", FIFO);
 

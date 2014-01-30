@@ -29,7 +29,7 @@ CPPFLAGS += -DENABLE_LIBEVENT -I./compat
 LDFLAGS += -pthread -levent
 SRCS += libevent_wrapper.c
 
-#CPPFLAGS += -DLIBEVENT_WRAPPER_AUTO_INIT
+CPPFLAGS += -DLIBEVENT_WRAPPER_AUTO_INIT
 
 
 OBJS = $(SRCS:.c=.o)

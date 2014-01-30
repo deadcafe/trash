@@ -25,7 +25,7 @@ enum {
 };
 
 typedef struct {
-  char *content_type;
+  char content_type[128];
   buffer *body;
 } http_content;
 
@@ -45,9 +45,11 @@ extern bool stop_http_client(void);
 
 /* new function */
 extern http_content *create_http_content(const char *content_type,
-                                         const void *body_p,
-                                         size_t body_length);
+                                         const void *body, size_t length);
 extern void free_http_content(http_content *content);
+extern bool set_type_http_content(http_content *content, const char *type);
+extern bool append_body_http_content(http_content *content,
+                                     const void *body, size_t len);
 
 
 #endif	/* !_HTTP_CLIENT_H_ */

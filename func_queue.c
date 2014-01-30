@@ -38,13 +38,6 @@ typedef struct {
 } func_q_msg_t;
 
 
-bool is_enable_libevent_wrapper(void) __attribute__((weak));
-
-bool
-is_enable_libevent_wrapper(void)
-{
-  return false;
-}
 
 static inline void
 CLOSE(int fd)
@@ -64,41 +57,35 @@ CLOSE(int fd)
 static bool
 wakeup(func_q_info_t *info)
 {
-  if (info->val) {
-    int err = 0;
+  int err = 0;
+  TRACE("knocking another thread. iam:%x", (unsigned)pthread_self());
 
-    while (!err && info->val) {
-      TRACE("knocking another thread. iam:%x", (unsigned)pthread_self());
+  while (!err && info->val) {
 
-      if (eventfd_write(info->fd, info->val) < 0) {
-        err = errno;
-        if (err == EINTR) {
-          err = 0;
-        } else if (err == EAGAIN) {
-          break;
-        } else {
-          char buf[128];
-          strerror_r(err, buf, sizeof(buf));
-          ERROR("failed eventfd_write() %s", buf);
-
-          if (info->another->queue) {
-            if (info->another->eh_type == EH_TYPE_GENERIC) {
-              set_writable(info->fd, false);
-            } else {
-              set_writable_safe(info->fd, false);
-            }
-          }
-          return false;
-        }
+    err = 0;
+    if (eventfd_write(info->fd, info->val) < 0) {
+      err = errno;
+      if (err == EINTR) {
+        err = 0;
+      } else if (err == EAGAIN) {
+        break;
       } else {
-        info->val = 0;
-        if (info->another->queue) {
-          if (info->another->eh_type == EH_TYPE_GENERIC) {
-            set_writable(info->fd, false);
-          } else {
-            set_writable_safe(info->fd, false);
-          }
-        }
+        char buf[128];
+        strerror_r(err, buf, sizeof(buf));
+        ERROR("failed eventfd_write() %s", buf);
+        return false;
+      }
+    } else {
+      info->val = 0;
+    }
+  }
+
+  if (info->val) {
+    if (info->another->queue) {
+      if (info->another->eh_type == EH_TYPE_GENERIC) {
+        set_writable(info->fd, true);
+      } else {
+        set_writable_safe(info->fd, true);
       }
     }
   }
@@ -197,21 +184,15 @@ func_q_bind( func_q_t *func_q,
     if (info->eh_type == EH_TYPE_GENERIC) {
       set_fd_handler(info->fd, read_cb, info, null_cb, NULL);
       set_readable(info->fd, true);
-      set_writable(info->fd, false);
 
       set_fd_handler(info->another->fd, null_cb, NULL,
                      write_cb, info->another);
-      set_readable(info->another->fd, false);
-      set_writable(info->another->fd, false);
     } else {
       set_fd_handler_safe(info->fd, read_cb, info, null_cb, NULL);
       set_readable_safe(info->fd, true);
-      set_writable_safe(info->fd, false);
 
       set_fd_handler_safe(info->another->fd, null_cb, NULL,
                           write_cb, info->another);
-      set_readable_safe(info->another->fd, false);
-      set_writable_safe(info->another->fd, false);
     }
     info->bind_th = pthread_self();
     info->queue = queue;

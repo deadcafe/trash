@@ -37,6 +37,17 @@ typedef struct {
   pthread_barrier_t barrier;
 } http_th_info_t;
 
+typedef struct {
+  http_content *content;
+  int status;
+  int code;
+
+  http_resp_handler cb;
+  void *arg;
+  char error[CURL_ERROR_SIZE];
+} http_response_t;
+
+
 typedef struct _http_transaction_t {
   CURL *easy;
   http_th_info_t *th_info;
@@ -46,30 +57,29 @@ typedef struct _http_transaction_t {
 
   int method;
   http_content *request;
-  struct {
-    http_content *content;
-    int status;
-    int code;
-
-    http_resp_handler cb;
-    void *arg;
-  } response;
+  http_response_t *res;
 
   struct curl_slist *slist;
-
-  char *url;
-  char error[CURL_ERROR_SIZE];
 } http_transaction_t;
 
 
 #define	FREE(_p)	xfree((_p))
 #define	MALLOC(_s)	xmalloc((_s))
 
-static void clean_completed_http_transaction(http_th_info_t *th_info);
+static void clean_completed_transaction(http_th_info_t *th_info);
 static void reply_handler(void *arg);
 
 static http_th_info_t *HTTP_THREAD_INFO;
 static pthread_t http_client_thread;
+
+
+bool is_enable_libevent_wrapper(void) __attribute__((weak));
+
+bool
+is_enable_libevent_wrapper(void)
+{
+  return false;
+}
 
 static inline char *
 strdup_raw(const char *src) {
@@ -152,7 +162,6 @@ multi_add_easy(CURLM *multi,
 /*****************************************************************************
  * Multi Timer
  *****************************************************************************/
-/* Called by libevent when our timeout expires */
 static void
 multi_timer_cb(void *arg)
 {
@@ -164,13 +173,10 @@ multi_timer_cb(void *arg)
   if (MULTI_ACTION(th_info->multi, CURL_SOCKET_TIMEOUT, 0, &th_info->running))
     exit(1);
 
-  clean_completed_http_transaction(th_info);
-
-  TRACE("<-----Polling Timer Expired: running:%d", th_info->running);
+  clean_completed_transaction(th_info);
 }
 
 
-/* Update the event timer after curl_multi library calls */
 static int
 multi_timer_update(CURLM *multi __attribute__((unused)),
                    long timeout_ms,
@@ -204,18 +210,89 @@ multi_timer_update(CURLM *multi __attribute__((unused)),
  * Http_Transaction
  *****************************************************************************/
 static void
-destroy_http_transaction(http_transaction_t *trans)
+destroy_http_response(http_response_t *res)
+{
+  TRACE("res:%p", res);
+  if (res) {
+    res->cb = NULL;
+    res->arg = NULL;
+    if (res->content) {
+      TRACE("content:%p", res->content);
+      free_http_content(res->content);
+      res->content = NULL;
+    }
+    FREE(res);
+  }
+}
+
+bool
+set_type_http_content(http_content *content,
+                      const char *type)
+{
+  DEBUG("content:%p type:%s", content, type);
+
+  if (type)
+    snprintf(content->content_type, sizeof(content->content_type), "%s" , type);
+  return true;
+}
+
+bool
+append_body_http_content(http_content *content,
+                         const void *body, size_t len)
+{
+  DEBUG("content:%p body:%p len:%zu", content, body, len);
+  if (body && len) {
+    char *p = append_back_buffer(content->body, len);
+    if (!p) {
+      ERROR("failed append_back_buffer:%p len:%zu", content->body, len);
+      return false;
+    }
+    memcpy(p, body, len);
+  }
+  return true;
+}
+
+
+static http_response_t *
+create_http_response(http_resp_handler cb,
+                     void *arg)
+{
+  http_response_t *res = MALLOC(sizeof(*res));
+  if (res) {
+    res->cb = cb;
+    res->arg = arg;
+    res->status = -1;
+    res->code = HTTP_TRANSACTION_FAILED;
+    if ((res->content = create_http_content(NULL, NULL, 0)) == NULL) {
+      destroy_http_response(res);
+      res = NULL;
+    } else {
+      TRACE("content:%p", res->content);
+    }
+  }
+  TRACE("res:%p", res);
+  return res;
+}
+
+
+static void
+destroy_transaction(http_transaction_t *trans)
 {
   TRACE("trans:%p", trans);
 
   if (trans) {
     if (trans->sock >= 0) {
+      set_readable_safe(trans->sock, false);
+      set_writable_safe(trans->sock, false);
       delete_fd_handler(trans->sock);
       trans->sock = -1;
     }
 
     if (trans->easy) {
-      curl_multi_remove_handle(trans->th_info->multi, trans->easy);
+      if (trans->th_info) {
+        curl_multi_remove_handle(trans->th_info->multi, trans->easy);
+        trans->th_info = NULL;
+      }
       curl_easy_cleanup(trans->easy);
       trans->easy = NULL;
     }
@@ -230,68 +307,82 @@ destroy_http_transaction(http_transaction_t *trans)
       trans->request = NULL;
     }
 
-    if (trans->url) {
-      FREE(trans->url);
-      trans->url = NULL;
+    if (trans->res) {
+      destroy_http_response(trans->res);
+      trans->res = NULL;
     }
-    if (trans->response.content) {
-      free_http_content(trans->response.content);
-      trans->response.content = NULL;
-    }
-    trans->response.cb = NULL;
-    trans->response.arg = NULL;
     FREE(trans);
   }
 }
 
 
-/* Check for completed transfers, and remove their easy handles */
 static void
-clean_completed_http_transaction(http_th_info_t *th_info)
+done_transaction(http_th_info_t *th_info,
+                 CURLcode rc,
+                 CURL *easy,
+                 http_response_t *res)
+{
+  char *url;
+
+  curl_easy_getinfo(easy, CURLINFO_EFFECTIVE_URL, &url);
+  if (rc == CURLE_OK) {
+    int code;
+
+    if (curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &code) == CURLE_OK) {
+      char *type;
+      res->code = code;
+
+      if (code >= 200 && code < 300)
+        res->status = HTTP_TRANSACTION_SUCCEEDED;
+
+      if (curl_easy_getinfo(easy, CURLINFO_CONTENT_TYPE, &type) ==  CURLE_OK)
+        set_type_http_content(res->content, type);
+    }
+  }
+
+  if (res->status == HTTP_TRANSACTION_SUCCEEDED) {
+    DEBUG("DONE: %s => code:%d status:%d", url, res->code, res->status);
+  } else {
+    NOTICE("failed %s => (%d) %s code:%d status:%d",
+           url, rc, res->error, res->code, res->status);
+  }
+
+  if (!func_q_request(th_info->func_q, DIR_TO_DOWN, reply_handler, res))
+    destroy_http_response(res);
+
+  curl_easy_cleanup(easy);
+}
+
+static void
+clean_completed_transaction(http_th_info_t *th_info)
 {
   CURLMsg *msg;
-  int msgs_left;
+  int *msgs_left = &th_info->running;
 
   TRACE("REMAINING: %d", th_info->running);
-  while ((msg = curl_multi_info_read(th_info->multi, &msgs_left))) {
+  while ((msg = curl_multi_info_read(th_info->multi, msgs_left))) {
 
     if (msg->msg == CURLMSG_DONE) {
       http_transaction_t *trans;
       CURL *easy;
       CURLcode rc;
-      int code = -1;
-      char *type = NULL;
+      http_response_t *res;
 
       rc = msg->data.result;
-
       easy = msg->easy_handle;
+
       curl_easy_getinfo(easy, CURLINFO_PRIVATE, &trans);
+      assert(trans);
 
-      if (curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &code) == CURLE_OK) {
-        trans->response.code = code;
+      curl_multi_remove_handle(trans->th_info->multi, easy);
+      trans->easy = NULL;
+      trans->th_info = NULL;
 
-        if (code >= 200 && code < 300)
-          trans->response.status = HTTP_TRANSACTION_SUCCEEDED;
+      res = trans->res;
+      trans->res = NULL;
 
-        if (curl_easy_getinfo(easy, CURLINFO_CONTENT_TYPE, &type) ==  CURLE_OK) {
-          if (type)
-            trans->response.content->content_type = strdup_raw(type);
-        }
-      }
-
-      if (trans->response.status == HTTP_TRANSACTION_SUCCEEDED) {
-        DEBUG("DONE: %s => (%d) %s code:%d status:%d",
-              trans->url, rc, trans->error,
-              trans->response.code, trans->response.status);
-      } else {
-        NOTICE("failed %s => (%d) %s code:%d status:%d",
-               trans->url, rc, trans->error,
-               trans->response.code, trans->response.status);
-      }
-
-      if (!func_q_request(trans->th_info->func_q, DIR_TO_DOWN,
-                          reply_handler, trans))
-        destroy_http_transaction(trans);
+      done_transaction(th_info, rc, easy, res);
+      destroy_transaction(trans);
     }
   }
 }
@@ -307,9 +398,9 @@ trans_handler_raw(int sock,
   TRACE("trans:%p sock:%d action:0x%x", trans, sock, action);
 
   if (MULTI_ACTION(th_info->multi, sock, action, &th_info->running))
-    destroy_http_transaction(trans);
+    destroy_transaction(trans);
 
-  clean_completed_http_transaction(th_info);
+  clean_completed_transaction(th_info);
 
   if (th_info->running <= 0) {
     if (th_info->timer) {
@@ -338,36 +429,6 @@ trans_handler_out(int sock,
 }
 
 
-static inline int
-update_transaction(http_transaction_t *trans,
-                   curl_socket_t sock,
-                   int action)
-{
-  CURLMcode rc;
-  http_th_info_t *th_info = trans->th_info;
-  const char *whatstr[] = { "none", "IN", "OUT", "INOUT", "REMOVE" };
-
-  if (trans->sock < 0) {
-    rc = curl_multi_assign(th_info->multi, sock, trans);
-    if (rc != CURLM_OK) {
-      TRACE("ERROR: curl_multi_assign() returns %s", curl_multi_strerror(rc));
-      return -1;
-    }
-    trans->sock = sock;
-    set_fd_handler_safe(sock, trans_handler_in, trans,
-                        trans_handler_out, trans);
-  }
-  set_readable_safe(sock, action & CURL_POLL_IN);
-  set_writable_safe(sock, action & CURL_POLL_OUT);
-
-  TRACE("trans:%p sock:%d Changing action from %s to %s",
-        trans, sock, whatstr[trans->action], whatstr[action]);
-
-  trans->action = action;
-  return 0;
-}
-
-
 static int
 update_handler(CURL *easy,
                curl_socket_t sock,
@@ -377,23 +438,41 @@ update_handler(CURL *easy,
 {
   http_th_info_t *th_info = multi_arg;
   http_transaction_t *trans = easy_arg;
+  const char *whatstr[] = { "none", "IN", "OUT", "INOUT", "REMOVE" };
   int ret = 0;
 
   TRACE("easy:%p sock:%d trans:%p action:%d---->", easy, sock, trans, action);
   assert(th_info);
 
+  if (!trans)
+    curl_easy_getinfo(easy, CURLINFO_PRIVATE, &trans);
+
   if (action == CURL_POLL_REMOVE) {
     if (trans->sock >= 0) {
+      set_readable_safe(trans->sock, false);
+      set_writable_safe(trans->sock, false);
       delete_fd_handler_safe(trans->sock);
       trans->sock = -1;
     }
-    trans->action = action;
   } else {
-    if (!trans)
-      curl_easy_getinfo(easy, CURLINFO_PRIVATE, &trans);
-    ret = update_transaction(trans, sock, action);
+    if (trans->sock < 0) {
+      CURLMcode rc;
+
+      rc = curl_multi_assign(th_info->multi, sock, trans);
+      if (rc != CURLM_OK) {
+        TRACE("ERROR: curl_multi_assign() returns %s", curl_multi_strerror(rc));
+        return -1;
+      }
+      trans->sock = sock;
+      set_fd_handler_safe(sock, trans_handler_in, trans, trans_handler_out, trans);
+    }
+    set_readable_safe(sock, action & CURL_POLL_IN);
+    set_writable_safe(sock, action & CURL_POLL_OUT);
+
   }
-  TRACE("<-------------ret:%d", ret);
+  TRACE("trans:%p sock:%d Changing action from %s to %s",
+        trans, sock, whatstr[trans->action], whatstr[action]);
+  trans->action = action;
   return ret;
 }
 
@@ -430,26 +509,19 @@ read_from_buffer( void *ptr,
 
 
 static size_t
-write_to_buffer( void *contents,
+write_to_buffer( void *src,
                  size_t size,
                  size_t nmemb,
                  void *arg )
 {
   http_content *content = arg;
-  buffer *buf = NULL;
 
-  TRACE( "Writing contents ( contents:%p size:%zu nmemb:%zu arg:%p ).",
-         contents, size, nmemb, arg );
+  TRACE( "Writing contents src:%p size:%zu nmemb:%zu content:%p",
+         src, size, nmemb, content );
   size_t real_size = size * nmemb;
 
-  if ((buf = content->body) != NULL) {
-    void *p = append_back_buffer( buf, real_size );
-    if (p && real_size)
-      memcpy( p, contents, real_size );
-  }
-
-  TRACE( "%zu bytes data is written into buffer ( buf:%p length:%zu ).",
-         real_size, buf, buf->length );
+  assert(content);
+  append_body_http_content(content, src, real_size);
   return real_size;
 }
 
@@ -459,7 +531,10 @@ http_client_th_entry( void *arg )
 {
   http_th_info_t *th_info = arg;
 
-  add_thread();
+  TRACE("start http client thread");
+  if (!is_enable_libevent_wrapper())
+    add_thread();
+
   init_event_handler_safe();
   init_signal_handler_safe();
   init_timer_safe();
@@ -468,9 +543,9 @@ http_client_th_entry( void *arg )
 
   pthread_barrier_wait(&th_info->barrier);
 
-  DEBUG("start http client thread:%x", (unsigned)pthread_self());
+  DEBUG("going event handler loop");
   start_event_handler_safe();
-  DEBUG("ending http client thread:%x", (unsigned)pthread_self());
+  DEBUG("break out event handler loop");
 
   func_q_unbind(th_info->func_q, DIR_TO_UP);
 
@@ -482,7 +557,7 @@ http_client_th_entry( void *arg )
   finalize_signal_handler_safe();
   finalize_event_handler_safe();
 
-  INFO("END http client thread:%x", (unsigned)pthread_self());
+  INFO("END http client thread");
   return arg;
 }
 
@@ -496,13 +571,11 @@ request_handler(void *arg)
     TRACE("trans:%p", trans);
 
     if (MULTI_ADD_EASY(trans->th_info->multi, trans->easy)) {
-      trans->response.status = HTTP_TRANSACTION_FAILED;
-      trans->response.code = -1;
-
       if (!func_q_request(trans->th_info->func_q, DIR_TO_DOWN,
-                          reply_handler, trans)) {
+                          reply_handler, trans->res)) {
         TRACE("failed to exec func_q_request()");
-        destroy_http_transaction(trans);
+        trans->th_info = NULL;
+        destroy_transaction(trans);
       }
     }
   }
@@ -513,13 +586,13 @@ static void
 stop_http_thread(void *arg)
 {
   http_th_info_t *th_info = arg;
+  assert(th_info);
 
-  if (th_info) {
-    TRACE("stoping thread");
-    stop_event_handler_safe();
+  TRACE("stoping thread");
+  stop_event_handler_safe();
 
-    /* XXX: leak transaction */
-  }
+  /* XXX: leak remaining transaction, sorry (;-p */
+  /* maybe use transaction list */
 }
 
 
@@ -689,14 +762,9 @@ do_http_request( int method,
     memset(trans, 0, sizeof(*trans));
     trans->th_info = HTTP_THREAD_INFO;
     trans->sock = -1;
-    trans->response.status = -1;
-    trans->response.code = HTTP_TRANSACTION_FAILED;
 
-    if ((trans->url = strdup_raw(url)) == NULL)
-      goto error;
-
-    trans->response.content = create_http_content(NULL, NULL, 0);
-    if (!trans->response.content)
+    trans->res = create_http_response(cb, cb_arg);
+    if (!trans->res)
       goto error;
 
     if ((trans->easy = curl_easy_init()) == NULL) {
@@ -734,19 +802,21 @@ do_http_request( int method,
         content_length = (long) trans->request->body->length - 1L;
     }
 
+    TRACE("");
+
     EASY_SETOPT(trans->easy, CURLOPT_TCP_NODELAY, 1L);
     EASY_SETOPT(trans->easy, CURLOPT_TIMEOUT, trans->th_info->response_timeout);
     EASY_SETOPT(trans->easy, CURLOPT_CONNECTTIMEOUT,
                 trans->th_info->connect_timeout);
 
     EASY_SETOPT(trans->easy, CURLOPT_USERAGENT, USER_AGENT );
-    EASY_SETOPT(trans->easy, CURLOPT_URL, trans->url);
+    EASY_SETOPT(trans->easy, CURLOPT_URL, url);
     EASY_SETOPT(trans->easy, CURLOPT_NOPROGRESS, 1L);
 
     EASY_SETOPT(trans->easy, CURLOPT_WRITEFUNCTION, write_to_buffer);
-    EASY_SETOPT(trans->easy, CURLOPT_WRITEDATA, trans->response);
+    EASY_SETOPT(trans->easy, CURLOPT_WRITEDATA, trans->res->content);
 
-    EASY_SETOPT(trans->easy, CURLOPT_ERRORBUFFER, trans->error);
+    EASY_SETOPT(trans->easy, CURLOPT_ERRORBUFFER, trans->res->error);
     EASY_SETOPT(trans->easy, CURLOPT_PRIVATE, trans);
 
     switch (method) {
@@ -780,10 +850,6 @@ do_http_request( int method,
     if (trans->slist)
       EASY_SETOPT(trans->easy, CURLOPT_HTTPHEADER, trans->slist);
 
-    /* all ok */
-    trans->response.cb = cb;
-    trans->response.arg = cb_arg;
-
     if (!func_q_request(trans->th_info->func_q, DIR_TO_UP,
                         request_handler, trans)) {
       ERROR("failed to exec func_q_request()");
@@ -792,7 +858,7 @@ do_http_request( int method,
 
     if (0) {
   error:
-      destroy_http_transaction(trans);
+      destroy_transaction(trans);
       trans = NULL;
     }
   }
@@ -805,14 +871,12 @@ do_http_request( int method,
 
 static void
 reply_handler(void *arg) {
-  http_transaction_t *trans = arg;
+  http_response_t *res = arg;
 
-  if (trans) {
-    TRACE("trans:%p sock:%d cb:%p", trans, trans->sock, trans->response.cb);
-    trans->response.cb(trans->response.status, trans->response.code,
-                       trans->response.content, trans->response.arg);
-    destroy_http_transaction(trans);
-  }
+  TRACE("res:%p", res);
+  if (res->cb)
+    res->cb(res->status, res->code, res->content, res->arg);
+  destroy_http_response(res);
 }
 
 void
@@ -820,10 +884,6 @@ free_http_content(http_content *content)
 {
   DEBUG("content:%p", content);
   if (content) {
-    if (content->content_type) {
-      FREE(content->content_type);
-      content->content_type = NULL;
-    }
     if (content->body) {
       free_buffer(content->body);
       content->body = NULL;
@@ -834,29 +894,22 @@ free_http_content(http_content *content)
 
 
 http_content *
-create_http_content(const char *content_type,
-                    const void *body_p,
-                    size_t body_length)
+create_http_content(const char *type,
+                    const void *body,
+                    size_t length)
 {
   http_content *content = MALLOC(sizeof(*content));
   if (content) {
-    content->content_type = NULL;
-    content->body = NULL;
-
-    if (content_type) {
-      if ((content->content_type = strdup_raw(content_type)) == NULL)
-        goto error;
-    }
+    memset(content, 0, sizeof(*content));
 
     if ((content->body = alloc_buffer()) == NULL)
       goto error;
 
-    if (body_length && body_p) {
-      char *p = append_back_buffer(content->body, body_length);
-      if (!p)
-        goto error;
-      memcpy(p, body_p, body_length);
-    }
+    if (!set_type_http_content(content, type))
+      goto error;
+
+    if (!append_body_http_content(content, body, length))
+      goto error;
 
     if (0) {
     error:
@@ -864,7 +917,6 @@ create_http_content(const char *content_type,
       content = NULL;
     }
   }
-  DEBUG("content:%p type:%p body:%p len:%ul",
-        content, content_type, body_p, body_length);
+  DEBUG("content:%p type:%p body:%p len:%ul", content, type, body, length);
   return content;
 }
