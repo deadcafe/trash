@@ -27,19 +27,17 @@
 
 /* HTTP client thread info */
 typedef struct {
-  long response_timeout;		/* msec */
-  long connect_timeout;			/* msec */
+  long response_timeout;
+  long connect_timeout;
 
   CURLM *multi;
   int running;
   bool timer;
 
-  void (*exit_cb)(void *);
-  void *arg;
-
   func_q_t *func_q;
   pthread_barrier_t barrier;
 } http_th_info_t;
+
 
 typedef struct {
   http_content *content;
@@ -76,7 +74,9 @@ static void reply_from_client(void *arg);
 static http_th_info_t *HTTP_THREAD_INFO;
 static pthread_t http_client_thread;
 
-
+/*
+ * libevent_wrapper checker
+ */
 bool is_enable_libevent_wrapper(void) __attribute__((weak));
 
 bool
@@ -184,9 +184,6 @@ destroy_transaction(http_transaction_t *trans)
     FREE(trans);
   }
 }
-
-
-
 
 
 /********************************************************************
@@ -514,7 +511,7 @@ http_client_th_entry( void *arg )
 {
   http_th_info_t *th_info = arg;
 
-  TRACE("start http client thread");
+  INFO("start http client thread");
   if (!is_enable_libevent_wrapper())
     add_thread();
 
@@ -532,9 +529,10 @@ http_client_th_entry( void *arg )
 
   func_q_unbind(th_info->func_q, DIR_TO_UP);
 
-  if (th_info->exit_cb)
-    func_q_request(th_info->func_q, DIR_TO_DOWN,
-                   th_info->exit_cb, th_info->arg);
+  if (th_info->timer) {
+    delete_timer_event_safe(multi_timer_cb, th_info);
+    th_info->timer = false;
+  }
 
   finalize_timer_safe();
   finalize_signal_handler_safe();
@@ -590,10 +588,6 @@ destroy_http_th(http_th_info_t *th_info)
   if (th_info) {
     TRACE("th_info:%p", th_info);
 
-    if (th_info->timer) {
-      delete_timer_event_safe(multi_timer_cb, th_info);
-      th_info->timer = false;
-    }
 
     if (th_info->func_q) {
       TRACE("func_q:%p", th_info->func_q);
@@ -611,9 +605,7 @@ destroy_http_th(http_th_info_t *th_info)
 
 
 static http_th_info_t *
-create_http_th(void (*exit_cb)(void *),
-               void *arg,
-               time_t response_to,
+create_http_th(time_t response_to,
                time_t connect_to)
 {
   http_th_info_t *th_info;
@@ -639,9 +631,6 @@ create_http_th(void (*exit_cb)(void *),
     MULTI_SETOPT(th_info->multi, CURLMOPT_SOCKETDATA, th_info);
     MULTI_SETOPT(th_info->multi, CURLMOPT_TIMERFUNCTION, multi_timer_update);
     MULTI_SETOPT(th_info->multi, CURLMOPT_TIMERDATA, th_info);
-
-    th_info->exit_cb = exit_cb;
-    th_info->arg = arg;
 
     if (!func_q_bind(th_info->func_q, DIR_TO_DOWN, EH_TYPE_GENERIC))
       goto error;
@@ -679,57 +668,24 @@ reply_from_client(void *arg) {
 bool
 init_http_client(const void *unused __attribute__((unused)))
 {
-  return init_http_client_new(NULL, NULL, HTTP_TIMEOUT, CONNECT_TIMEOUT);
+  return init_http_client_new(HTTP_TIMEOUT, CONNECT_TIMEOUT);
 }
-
 
 bool
 finalize_http_client(void)
 {
-  return false;
-}
-
-
-bool
-init_http_client_new(void (*exit_cb)(void *),
-                     void *arg,
-                     time_t response_to,
-                     time_t connect_to)
-{
-  DEBUG("cb:%p arg:%p response:%u connect:u",
-        exit_cb, arg, response_to, connect_to);
-
-  if (HTTP_THREAD_INFO || !response_to || !connect_to )
-    return false;
-
-  if ((HTTP_THREAD_INFO = create_http_th(exit_cb, arg,
-                                         response_to, connect_to)) != NULL) {
-    pthread_attr_t attr;
-    int ret;
-
-    pthread_attr_init( &attr );
-    pthread_attr_setdetachstate( &attr, PTHREAD_CREATE_DETACHED );
-    ret = pthread_create( &http_client_thread, &attr,
-                          http_client_th_entry, HTTP_THREAD_INFO );
-    if (ret) {
-      finalize_http_client();
-      return false;
-    }
-    pthread_barrier_wait(&HTTP_THREAD_INFO->barrier);
-    return true;
-  }
-  return false;
-}
-
-
-bool
-finalize_http_client_new(void)
-{
   DEBUG("");
   if (HTTP_THREAD_INFO) {
     http_th_info_t *th_info = HTTP_THREAD_INFO;
+    void *ptr;
 
     HTTP_THREAD_INFO = NULL;
+
+    if (http_client_thread) {
+      func_q_request(th_info->func_q, DIR_TO_UP, stop_from_main, th_info);
+      pthread_join(http_client_thread, &ptr);
+      http_client_thread = 0;
+    }
 
     func_q_unbind(th_info->func_q, DIR_TO_DOWN);
     destroy_http_th(th_info);
@@ -743,20 +699,31 @@ finalize_http_client_new(void)
 
 
 bool
-stop_http_client_new(void)
+init_http_client_new(time_t response_to,
+                     time_t connect_to)
 {
-  DEBUG("");
-  if (HTTP_THREAD_INFO) {
-    http_th_info_t *th_info = HTTP_THREAD_INFO;
+  DEBUG("response:%u connect:u", response_to, connect_to);
 
-    func_q_request(th_info->func_q, DIR_TO_UP, stop_from_main, th_info);
+  if (HTTP_THREAD_INFO || !response_to || !connect_to )
+    return false;
+
+  if ((HTTP_THREAD_INFO = create_http_th(response_to, connect_to)) != NULL) {
+    int ret;
+
+    http_client_thread = 0;
+
+    /* note: joinable */
+    ret = pthread_create( &http_client_thread, NULL,
+                          http_client_th_entry, HTTP_THREAD_INFO );
+    if (ret) {
+      finalize_http_client();
+      return false;
+    }
+    pthread_barrier_wait(&HTTP_THREAD_INFO->barrier);
     return true;
-  } else {
-    NOTICE("nothing http client thread");
   }
   return false;
 }
-
 
 #define USER_AGENT "Bisco/0.0.3"
 

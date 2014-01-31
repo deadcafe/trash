@@ -82,7 +82,7 @@ wakeup(func_q_info_t *info)
 
   if (info->val) {
     if (info->another->queue) {
-      if (info->another->eh_type == EH_TYPE_GENERIC) {
+      if (info->eh_type == EH_TYPE_GENERIC) {
         set_writable(info->fd, true);
       } else {
         set_writable_safe(info->fd, true);
@@ -185,14 +185,12 @@ func_q_bind( func_q_t *func_q,
       set_fd_handler(info->fd, read_cb, info, null_cb, NULL);
       set_readable(info->fd, true);
 
-      set_fd_handler(info->another->fd, null_cb, NULL,
-                     write_cb, info->another);
+      set_fd_handler(info->another->fd, null_cb, NULL, write_cb, info->another);
     } else {
       set_fd_handler_safe(info->fd, read_cb, info, null_cb, NULL);
       set_readable_safe(info->fd, true);
 
-      set_fd_handler_safe(info->another->fd, null_cb, NULL,
-                          write_cb, info->another);
+      set_fd_handler_safe(info->another->fd, null_cb, NULL, write_cb, info->another);
     }
     info->bind_th = pthread_self();
     info->queue = queue;
@@ -219,17 +217,6 @@ func_q_unbind(func_q_t *func_q,
   info->val = 0;
   WMB();
 
-  assert(info->bind_th == pthread_self());
-  info->bind_th = 0;
-
-  if (info->eh_type == EH_TYPE_GENERIC) {
-    delete_fd_handler(fd);
-    delete_fd_handler(another_fd);
-  } else {
-    delete_fd_handler_safe(fd);
-    delete_fd_handler_safe(another_fd);
-  }
-
   if (queue) {
     func_q_msg_t *msg;
 
@@ -239,6 +226,24 @@ func_q_unbind(func_q_t *func_q,
     }
     delete_queue(queue);
   }
+
+  assert(info->bind_th == pthread_self());
+  info->bind_th = 0;
+
+  if (info->eh_type == EH_TYPE_GENERIC) {
+    set_readable(fd, false);
+    delete_fd_handler(fd);
+
+    set_writable(another_fd, false);
+    delete_fd_handler(another_fd);
+  } else {
+    set_readable_safe(fd, false);
+    delete_fd_handler_safe(fd);
+
+    set_writable_safe(another_fd, false);
+    delete_fd_handler_safe(another_fd);
+  }
+
   DEBUG("q:%p dir:%d", func_q, dir);
 }
 

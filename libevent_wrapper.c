@@ -625,7 +625,7 @@ finalize_event_handler_x( void )
 {
   DEBUG("%x", (unsigned)pthread_self());
   if ( Base ) {
-    finalize_event_handler_r();
+    destroy_ev_base( Base );
     Base = NULL;
   } else {
     ERROR("not initialized");

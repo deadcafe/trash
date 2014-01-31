@@ -42,10 +42,7 @@ extern bool init_http_client(const void *);
 extern bool finalize_http_client(void);
 
 /* new function */
-extern bool init_http_client_new(void (*exit_cb)(void *), void *arg, time_t response_to, time_t connect_to);
-extern bool finalize_http_client_new(void);
-extern bool stop_http_client_new(void);
-
+extern bool init_http_client_new(time_t response_to, time_t connect_to);
 
 /* New tools */
 extern http_content *create_http_content(const char *content_type,

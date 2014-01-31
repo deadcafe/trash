@@ -32,6 +32,8 @@ typedef struct {
 } fifo_info_t;
 
 
+int counter;
+
 static inline void
 dump(const char *fmt, ...)
 {
@@ -46,9 +48,10 @@ static void
 resp(int status,
      int code,
      const http_content *content,
-     void *arg __attribute__((unused)))
+     void *arg)
 {
-  INFO("status:%d code:%d", status, code);
+  intptr_t p = (intptr_t) arg;
+  INFO("status:%d code:%d counter:%d p:%d", status, code, --counter, p);
 
   if (content) {
     INFO("type: %s", content->content_type);
@@ -109,11 +112,17 @@ fifo_cb(int sock,
     if (n && s[0]) {
 
       if (strcmp(s, "exit")) {
-        do_http_request( HTTP_METHOD_GET, s, NULL, resp, NULL);
+        intptr_t p = counter;
+
+        do_http_request( HTTP_METHOD_GET, s, NULL, resp, (void *)p);
+        counter++;
       } else {
-        stop_http_client_new();
+        set_readable(sock, false);
         delete_fd_handler(sock);
         fifo->sock = -1;
+
+        finalize_http_client();
+
         stop_event_handler();
         return;
       }
@@ -209,7 +218,6 @@ main(int ac, char **av)
   start_trema();
   TRACE("stoping trema");
 
-  finalize_http_client();
 
   TRACE("stopping main thread");
   destroy_fifo_info(fifo);
