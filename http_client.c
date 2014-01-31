@@ -16,8 +16,12 @@
 #include "func_queue.h"
 #include "http_client.h"
 
-#define ENABLE_TRACE
+//#define ENABLE_TRACE
 #include "private_log.h"
+
+
+#define	HTTP_TIMEOUT	60L
+#define CONNECT_TIMEOUT	(HTTP_TIMEOUT / 2L)
 
 
 
@@ -67,7 +71,7 @@ typedef struct _http_transaction_t {
 #define	MALLOC(_s)	xmalloc((_s))
 
 static void clean_completed_transaction(http_th_info_t *th_info);
-static void reply_handler(void *arg);
+static void reply_from_client(void *arg);
 
 static http_th_info_t *HTTP_THREAD_INFO;
 static pthread_t http_client_thread;
@@ -81,6 +85,9 @@ is_enable_libevent_wrapper(void)
   return false;
 }
 
+/********************************************************************
+ * common functions
+ ********************************************************************/
 static inline char *
 strdup_raw(const char *src) {
   size_t len = strlen(src) + 1;
@@ -99,116 +106,7 @@ strdup_raw(const char *src) {
     }                                                   \
   }
 
-#define MULTI_SETOPT(_m, _o, _p) {                              \
-    CURLMcode _rc = curl_multi_setopt((_m), (_o), (_p));        \
-    if (_rc != CURLM_OK) {                                      \
-      WARN("ERROR: curl_multi_setopt returns %s",               \
-           curl_multi_strerror(_rc));                           \
-      goto error;                                               \
-    }                                                           \
-  }
 
-
-static inline int
-multi_action(CURLM *multi,
-             curl_socket_t sock,
-             int action,
-             int *running,
-             const char *func)
-{
-  int ret = -1;
-  CURLMcode rc = curl_multi_socket_action(multi, sock, action, running);
-
-  switch (rc) {
-  case CURLM_OK:
-    ret = 0;
-    break;
-
-  case CURLM_BAD_SOCKET:
-    ret = 0;
-
-  default:
-    ERROR("ERROR: curl_multi_socket_action in %s returns %s",
-          func, curl_multi_strerror(rc));
-  }
-  return ret;
-}
-#define	MULTI_ACTION(_h, _s, _e, _r)	multi_action((_h),(_s),(_e),(_r), __func__)
-
-static inline int
-multi_add_easy(CURLM *multi,
-               CURL *easy,
-               const char *func)
-{
-  int ret = -1;
-  CURLMcode rc = curl_multi_add_handle(multi, easy);
-
-  switch (rc) {
-  case CURLM_OK:
-    ret = 0;
-    break;
-
-  case CURLM_BAD_SOCKET:
-    ret = 0;
-
-  default:
-    TRACE("ERROR: curl_multi_add_handle in %s returns %s",
-            func, curl_multi_strerror(rc));
-  }
-  return ret;
-}
-#define	MULTI_ADD_EASY(_m, _e)	multi_add_easy((_m), (_e), __func__)
-
-/*****************************************************************************
- * Multi Timer
- *****************************************************************************/
-static void
-multi_timer_cb(void *arg)
-{
-  http_th_info_t *th_info = arg;
-
-  TRACE("Polling Timer Expired %p:%p----->", multi_timer_cb, th_info);
-  th_info->timer = false;
-
-  if (MULTI_ACTION(th_info->multi, CURL_SOCKET_TIMEOUT, 0, &th_info->running))
-    exit(1);
-
-  clean_completed_transaction(th_info);
-}
-
-
-static int
-multi_timer_update(CURLM *multi __attribute__((unused)),
-                   long timeout_ms,
-                   http_th_info_t *th_info)
-{
-  TRACE("%p %ld ms", th_info, timeout_ms);
-
-  if (timeout_ms < 0)
-    return 0;
-
-  if (th_info->timer) {
-    delete_timer_event_safe(multi_timer_cb, th_info);
-    th_info->timer = false;
-  }
-
-  struct itimerspec to;
-
-  memset(&to, 0, sizeof(to));
-  to.it_value.tv_sec = timeout_ms / 1000;
-  to.it_value.tv_nsec = (timeout_ms % 1000) * 1000L * 1000L;
-
-  if (add_timer_event_callback_safe(&to, multi_timer_cb, th_info))
-    th_info->timer = true;
-  else
-    TRACE("ERROR: add_timer_event_callback");
-  return 0;
-}
-
-
-/*****************************************************************************
- * Http_Transaction
- *****************************************************************************/
 static void
 destroy_http_response(http_response_t *res)
 {
@@ -223,33 +121,6 @@ destroy_http_response(http_response_t *res)
     }
     FREE(res);
   }
-}
-
-bool
-set_type_http_content(http_content *content,
-                      const char *type)
-{
-  DEBUG("content:%p type:%s", content, type);
-
-  if (type)
-    snprintf(content->content_type, sizeof(content->content_type), "%s" , type);
-  return true;
-}
-
-bool
-append_body_http_content(http_content *content,
-                         const void *body, size_t len)
-{
-  DEBUG("content:%p body:%p len:%zu", content, body, len);
-  if (body && len) {
-    char *p = append_back_buffer(content->body, len);
-    if (!p) {
-      ERROR("failed append_back_buffer:%p len:%zu", content->body, len);
-      return false;
-    }
-    memcpy(p, body, len);
-  }
-  return true;
 }
 
 
@@ -273,7 +144,6 @@ create_http_response(http_resp_handler cb,
   TRACE("res:%p", res);
   return res;
 }
-
 
 static void
 destroy_transaction(http_transaction_t *trans)
@@ -316,6 +186,119 @@ destroy_transaction(http_transaction_t *trans)
 }
 
 
+
+
+
+/********************************************************************
+ * http client thread functions
+ ********************************************************************/
+#define MULTI_SETOPT(_m, _o, _p) {                              \
+    CURLMcode _rc = curl_multi_setopt((_m), (_o), (_p));        \
+    if (_rc != CURLM_OK) {                                      \
+      WARN("ERROR: curl_multi_setopt returns %s",               \
+           curl_multi_strerror(_rc));                           \
+      goto error;                                               \
+    }                                                           \
+  }
+
+
+static inline int
+multi_action(CURLM *multi,
+             curl_socket_t sock,
+             int action,
+             int *running,
+             const char *func)
+{
+  int ret = -1;
+  CURLMcode rc = curl_multi_socket_action(multi, sock, action, running);
+
+  switch (rc) {
+  case CURLM_OK:
+    ret = 0;
+    break;
+
+  case CURLM_BAD_SOCKET:
+    ret = 0;
+
+  default:
+    ERROR("ERROR: curl_multi_socket_action in %s returns %s",
+          func, curl_multi_strerror(rc));
+  }
+  return ret;
+}
+#define	MULTI_ACTION(_h, _s, _e, _r)	multi_action((_h),(_s),(_e),(_r), __func__)
+
+static inline int
+multi_add_easy(CURLM *multi,
+               CURL *easy,
+               const char *func __attribute__((unused)))
+{
+  int ret = -1;
+  CURLMcode rc = curl_multi_add_handle(multi, easy);
+
+  switch (rc) {
+  case CURLM_OK:
+    ret = 0;
+    break;
+
+  case CURLM_BAD_SOCKET:
+    ret = 0;
+
+  default:
+    TRACE("ERROR: curl_multi_add_handle in %s returns %s",
+          func, curl_multi_strerror(rc));
+  }
+  return ret;
+}
+#define	MULTI_ADD_EASY(_m, _e)	multi_add_easy((_m), (_e), __func__)
+
+
+static void
+multi_timer_cb(void *arg)
+{
+  http_th_info_t *th_info = arg;
+
+  TRACE("Polling Timer Expired %p:%p----->", multi_timer_cb, th_info);
+  th_info->timer = false;
+
+  if (MULTI_ACTION(th_info->multi, CURL_SOCKET_TIMEOUT, 0, &th_info->running))
+    exit(1);
+
+  clean_completed_transaction(th_info);
+}
+
+
+static int
+multi_timer_update(CURLM *multi __attribute__((unused)),
+                   long timeout_ms,
+                   http_th_info_t *th_info)
+{
+  TRACE("%p %ld ms", th_info, timeout_ms);
+
+  if (timeout_ms < 0)
+    return 0;
+
+  if (th_info->timer) {
+    delete_timer_event_safe(multi_timer_cb, th_info);
+    th_info->timer = false;
+  }
+
+  struct itimerspec to;
+
+  memset(&to, 0, sizeof(to));
+  to.it_value.tv_sec = timeout_ms / 1000;
+  to.it_value.tv_nsec = (timeout_ms % 1000) * 1000L * 1000L;
+  to.it_value.tv_nsec += 1;
+
+  if (add_timer_event_callback_safe(&to, multi_timer_cb, th_info))
+    th_info->timer = true;
+  else {
+    TRACE("ERROR: add_timer_event_callback");
+  }
+  return 0;
+}
+
+
 static void
 done_transaction(http_th_info_t *th_info,
                  CURLcode rc,
@@ -347,7 +330,7 @@ done_transaction(http_th_info_t *th_info,
            url, rc, res->error, res->code, res->status);
   }
 
-  if (!func_q_request(th_info->func_q, DIR_TO_DOWN, reply_handler, res))
+  if (!func_q_request(th_info->func_q, DIR_TO_DOWN, reply_from_client, res))
     destroy_http_response(res);
 
   curl_easy_cleanup(easy);
@@ -359,8 +342,8 @@ clean_completed_transaction(http_th_info_t *th_info)
   CURLMsg *msg;
   int *msgs_left = &th_info->running;
 
-  TRACE("REMAINING: %d", th_info->running);
   while ((msg = curl_multi_info_read(th_info->multi, msgs_left))) {
+    INFO("REMAINING: %d", th_info->running);
 
     if (msg->msg == CURLMSG_DONE) {
       http_transaction_t *trans;
@@ -430,11 +413,11 @@ trans_handler_out(int sock,
 
 
 static int
-update_handler(CURL *easy,
-               curl_socket_t sock,
-               int action,
-               void *multi_arg,
-               void *easy_arg)
+update_transaction(CURL *easy,
+                   curl_socket_t sock,
+                   int action,
+                   void *multi_arg,
+                   void *easy_arg)
 {
   http_th_info_t *th_info = multi_arg;
   http_transaction_t *trans = easy_arg;
@@ -460,7 +443,7 @@ update_handler(CURL *easy,
 
       rc = curl_multi_assign(th_info->multi, sock, trans);
       if (rc != CURLM_OK) {
-        TRACE("ERROR: curl_multi_assign() returns %s", curl_multi_strerror(rc));
+        ERROR("curl_multi_assign() returns %s", curl_multi_strerror(rc));
         return -1;
       }
       trans->sock = sock;
@@ -470,7 +453,7 @@ update_handler(CURL *easy,
     set_writable_safe(sock, action & CURL_POLL_OUT);
 
   }
-  TRACE("trans:%p sock:%d Changing action from %s to %s",
+  DEBUG("trans:%p sock:%d Changing action from %s to %s",
         trans, sock, whatstr[trans->action], whatstr[action]);
   trans->action = action;
   return ret;
@@ -563,7 +546,7 @@ http_client_th_entry( void *arg )
 
 
 static void
-request_handler(void *arg)
+request_from_main(void *arg)
 {
   http_transaction_t *trans = arg;
 
@@ -572,7 +555,7 @@ request_handler(void *arg)
 
     if (MULTI_ADD_EASY(trans->th_info->multi, trans->easy)) {
       if (!func_q_request(trans->th_info->func_q, DIR_TO_DOWN,
-                          reply_handler, trans->res)) {
+                          reply_from_client, trans->res)) {
         TRACE("failed to exec func_q_request()");
         trans->th_info = NULL;
         destroy_transaction(trans);
@@ -581,9 +564,11 @@ request_handler(void *arg)
   }
 }
 
-
+/*
+ * func_q handler
+ */
 static void
-stop_http_thread(void *arg)
+stop_from_main(void *arg)
 {
   http_th_info_t *th_info = arg;
   assert(th_info);
@@ -650,7 +635,7 @@ create_http_th(void (*exit_cb)(void *),
     }
 
     /* setup the generic multi interface options we want */
-    MULTI_SETOPT(th_info->multi, CURLMOPT_SOCKETFUNCTION, update_handler);
+    MULTI_SETOPT(th_info->multi, CURLMOPT_SOCKETFUNCTION, update_transaction);
     MULTI_SETOPT(th_info->multi, CURLMOPT_SOCKETDATA, th_info);
     MULTI_SETOPT(th_info->multi, CURLMOPT_TIMERFUNCTION, multi_timer_update);
     MULTI_SETOPT(th_info->multi, CURLMOPT_TIMERDATA, th_info);
@@ -674,11 +659,42 @@ create_http_th(void (*exit_cb)(void *),
 }
 
 
+/*
+ * func_q handler
+ */
+static void
+reply_from_client(void *arg) {
+  http_response_t *res = arg;
+
+  TRACE("res:%p", res);
+  if (res->cb)
+    res->cb(res->status, res->code, res->content, res->arg);
+  destroy_http_response(res);
+}
+
+
+/*****************************************************************************
+ * API
+ *****************************************************************************/
 bool
-init_http_client(void (*exit_cb)(void *),
-                 void *arg,
-                 time_t response_to,
-                 time_t connect_to)
+init_http_client(const void *unused __attribute__((unused)))
+{
+  return init_http_client_new(NULL, NULL, HTTP_TIMEOUT, CONNECT_TIMEOUT);
+}
+
+
+bool
+finalize_http_client(void)
+{
+  return false;
+}
+
+
+bool
+init_http_client_new(void (*exit_cb)(void *),
+                     void *arg,
+                     time_t response_to,
+                     time_t connect_to)
 {
   DEBUG("cb:%p arg:%p response:%u connect:u",
         exit_cb, arg, response_to, connect_to);
@@ -707,7 +723,7 @@ init_http_client(void (*exit_cb)(void *),
 
 
 bool
-finalize_http_client(void)
+finalize_http_client_new(void)
 {
   DEBUG("");
   if (HTTP_THREAD_INFO) {
@@ -727,13 +743,13 @@ finalize_http_client(void)
 
 
 bool
-stop_http_client( void)
+stop_http_client_new(void)
 {
   DEBUG("");
   if (HTTP_THREAD_INFO) {
     http_th_info_t *th_info = HTTP_THREAD_INFO;
 
-    func_q_request(th_info->func_q, DIR_TO_UP, stop_http_thread, th_info);
+    func_q_request(th_info->func_q, DIR_TO_UP, stop_from_main, th_info);
     return true;
   } else {
     NOTICE("nothing http client thread");
@@ -851,7 +867,7 @@ do_http_request( int method,
       EASY_SETOPT(trans->easy, CURLOPT_HTTPHEADER, trans->slist);
 
     if (!func_q_request(trans->th_info->func_q, DIR_TO_UP,
-                        request_handler, trans)) {
+                        request_from_main, trans)) {
       ERROR("failed to exec func_q_request()");
       goto error;
     }
@@ -868,16 +884,6 @@ do_http_request( int method,
   return false;
 }
 
-
-static void
-reply_handler(void *arg) {
-  http_response_t *res = arg;
-
-  TRACE("res:%p", res);
-  if (res->cb)
-    res->cb(res->status, res->code, res->content, res->arg);
-  destroy_http_response(res);
-}
 
 void
 free_http_content(http_content *content)
@@ -919,4 +925,33 @@ create_http_content(const char *type,
   }
   DEBUG("content:%p type:%p body:%p len:%ul", content, type, body, length);
   return content;
+}
+
+
+bool
+set_type_http_content(http_content *content,
+                      const char *type)
+{
+  DEBUG("content:%p type:%s", content, type);
+
+  if (type)
+    snprintf(content->content_type, sizeof(content->content_type), "%s" , type);
+  return true;
+}
+
+
+bool
+append_body_http_content(http_content *content,
+                         const void *body, size_t len)
+{
+  DEBUG("content:%p body:%p len:%zu", content, body, len);
+  if (body && len) {
+    char *p = append_back_buffer(content->body, len);
+    if (!p) {
+      ERROR("failed append_back_buffer:%p len:%zu", content->body, len);
+      return false;
+    }
+    memcpy(p, body, len);
+  }
+  return true;
 }

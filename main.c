@@ -48,14 +48,14 @@ resp(int status,
      const http_content *content,
      void *arg __attribute__((unused)))
 {
-  TRACE("status:%d code:%d", status, code);
+  INFO("status:%d code:%d", status, code);
 
   if (content) {
-    TRACE("type: %s", content->content_type);
+    INFO("type: %s", content->content_type);
 
     if (content->body->data) {
       //      dump_buffer(content->body, dump);
-      TRACE("resp content length:%zu", content->body->length);
+      INFO("resp content length:%zu", content->body->length);
       //      fputs(content->body->data, stderr);
     }
   }
@@ -80,7 +80,8 @@ destroy_fifo_info(fifo_info_t *fifo)
 }
 
 
-static void
+/* maybe unused */
+static inline void
 http_client_end(void *arg)
 {
   TRACE("arg:%p", arg);
@@ -110,9 +111,10 @@ fifo_cb(int sock,
       if (strcmp(s, "exit")) {
         do_http_request( HTTP_METHOD_GET, s, NULL, resp, NULL);
       } else {
-        stop_http_client();
+        stop_http_client_new();
         delete_fd_handler(sock);
         fifo->sock = -1;
+        stop_event_handler();
         return;
       }
     } else
@@ -159,7 +161,7 @@ create_fifo_info(void)
     set_fd_handler(sock, fifo_cb, fifo, NULL, NULL);
     set_readable(sock, true);
 
-    TRACE("Now, pipe some URL's into > %s", FIFO);
+    INFO("Now, pipe some URL's into > %s", FIFO);
 
     if (0) {
     error:
@@ -197,9 +199,9 @@ main(int ac, char **av)
   init_trema(&ac, &av);
   TRACE("Done trema init");
 
-  set_logging_level("debug");
+  set_logging_level("info");
 
-  init_http_client(http_client_end, NULL, 10L, 5L);
+  init_http_client(NULL);
 
   fifo = create_fifo_info();
 
@@ -207,6 +209,7 @@ main(int ac, char **av)
   start_trema();
   TRACE("stoping trema");
 
+  finalize_http_client();
 
   TRACE("stopping main thread");
   destroy_fifo_info(fifo);

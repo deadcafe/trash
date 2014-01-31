@@ -17,7 +17,7 @@
 #include "memory_barrier.h"
 #include "func_queue.h"
 
-#define ENABLE_TRACE
+//#define ENABLE_TRACE
 #include "private_log.h"
 
 #define	WMB()	write_memory_barrier()
@@ -291,7 +291,7 @@ func_q_create( void )
     func_q->info[DIR_TO_DOWN].fd = fd;
   }
  end:
-  TRACE("Q:%p", func_q);
+  DEBUG("Q:%p", func_q);
   return func_q;
 }
 
